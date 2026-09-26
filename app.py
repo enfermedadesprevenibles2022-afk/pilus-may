@@ -235,7 +235,16 @@ def apply_import(parsed: dict, mode: str) -> dict:
     return {"added": added, "duplicates": duplicates, "total": active_count()}
 
 
+def navigate(target: str):
+    """Programa un cambio de módulo para el siguiente rerun sin mutar el widget ya creado."""
+    st.session_state["_next_module"] = target
+    st.rerun()
+
+
 init_state()
+if st.session_state.get("_next_module") in MODULES:
+    st.session_state["module"] = st.session_state.pop("_next_module")
+
 
 st.title("📋 APP ETA - Investigación de brotes y Encuesta de Consumidores")
 st.caption("Dos formas de captura: importar el Anexo 2 ya diligenciado o realizar las encuestas directamente en campo desde la app.")
@@ -252,6 +261,9 @@ else:
     st.sidebar.metric("Encuestas diligenciadas", active_count())
 st.sidebar.caption("Máximo: 100 personas por investigación.")
 
+if st.session_state.get("import_success_message"):
+    st.success(st.session_state.pop("import_success_message"))
+
 if page == "1. Inicio / Importar":
     st.header("1. ¿Cómo quieres ingresar la información?")
     left, right = st.columns(2)
@@ -264,8 +276,7 @@ if page == "1. Inicio / Importar":
         st.write("Ideal para trabajo de campo. Registras **una persona a la vez**, incluidos síntomas y consumo de alimentos de los tres periodos del Anexo 2.")
         if st.button("🧑‍⚕️ Iniciar captura manual nueva", width="stretch"):
             reset_capture_records(15)
-            st.session_state.module = "2. Encuesta en campo"
-            st.rerun()
+            navigate("2. Encuesta en campo")
         st.caption("Este modo es independiente del modo Excel: aquí sí se diligencia persona por persona.")
 
     st.divider()
@@ -319,12 +330,11 @@ if page == "1. Inicio / Importar":
                     **result,
                 }
                 st.session_state.imported_source_name = uploaded.name
-                st.session_state.module = "4. Revisar registros"
-                st.success(
+                st.session_state["import_success_message"] = (
                     f"Excel incorporado. Se leyeron las dos pestañas del Anexo 2 y quedaron cargadas "
                     f"{result['total']} personas. No debes volver a diligenciarlas una a una."
                 )
-                st.rerun()
+                navigate("4. Revisar registros")
 
     if st.session_state.get("last_import"):
         li = st.session_state.last_import
@@ -345,17 +355,14 @@ elif page == "2. Encuesta en campo":
         c3.metric("Tasa de ataque", f"{a['attack_rate']:.1f}%")
         b1, b2 = st.columns(2)
         if b1.button("👥 Ir a revisar registros", type="primary", width="stretch"):
-            st.session_state.module = "4. Revisar registros"
-            st.rerun()
+            navigate("4. Revisar registros")
         if b2.button("📊 Ir a informes y análisis", width="stretch"):
-            st.session_state.module = "5. Informes y análisis"
-            st.rerun()
+            navigate("5. Informes y análisis")
         with st.expander("¿Necesitas comenzar una investigación manual diferente?"):
             st.warning("Esto inicia una captura manual nueva y separada. No mezcla ni obliga a editar el Excel importado persona por persona.")
             if st.button("Iniciar investigación manual nueva", key="switch_manual_from_excel"):
                 reset_capture_records(15)
-                st.session_state.module = "2. Encuesta en campo"
-                st.rerun()
+                navigate("2. Encuesta en campo")
     else:
         if st.session_state.capture_mode == "none":
             st.info("Para trabajo de campo, inicia primero el **modo manual** desde 1. Inicio / Importar.")
