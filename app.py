@@ -751,6 +751,7 @@ elif page == "5. Informes y análisis":
 else:
     st.header("6. Generar y descargar")
     st.write("Los archivos se generan solo al pulsar el botón. Tanto los Excel importados como las encuestas realizadas en la app quedan consolidados en el mismo resultado.")
+    st.info("El botón **ANEXO 3 DILIGENCIADO** descarga el formato oficial ya completado con los datos disponibles y los cálculos epidemiológicos. Los campos que no existen en el Anexo 2 (por ejemplo municipio, lugar, medidas de control o resultados de laboratorio) se completan en **5. Informes y análisis**.")
     payload = consumer_payload()
     a = analyze(payload)
     st.info(f"Se usarán {a['total_exposed']} personas diligenciadas, {a['total_cases']} casos y {len(st.session_state.foods)} alimentos definidos.")
@@ -778,18 +779,13 @@ else:
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
         )
         c2.download_button(
-            "⬇️ Informes 24 h + 72 h + final", reports_bytes, reports_name,
+            "⬇️ ANEXO 3 DILIGENCIADO — 24 h + 72 h + final", reports_bytes, reports_name,
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
         )
         st.download_button(
             "📦 Descargar expediente completo", zip_bytes, "ETA_expediente_completo.zip", "application/zip",
             type="primary", width="stretch",
         )
-        if ANEXO3_TEMPLATE.exists():
-            st.download_button(
-                "📄 Descargar plantilla oficial Anexo 3", ANEXO3_TEMPLATE.read_bytes(), ANEXO3_TEMPLATE.name,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
-            )
 
 st.divider()
 st.caption(

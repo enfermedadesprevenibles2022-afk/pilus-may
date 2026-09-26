@@ -499,6 +499,36 @@ class XlsxTemplatePatcher:
     def mark(self, sheet: str, ref: str, selected: bool):
         self.set_text(sheet, ref, "X" if selected else "")
 
+    def set_formula_cache(self, sheet: str, ref: str, value: Any):
+        """Actualiza el valor visible/cache de una celda con fórmula sin borrar la fórmula ni el formato."""
+        cell = self._cell(sheet, ref)
+        f_tag = f"{{{NS_MAIN}}}f"
+        v_tag = f"{{{NS_MAIN}}}v"
+        formula = cell.find(f_tag)
+        if formula is None:
+            self.set(sheet, ref, value)
+            return
+        for child in list(cell):
+            if child.tag != f_tag:
+                cell.remove(child)
+        if isinstance(value, str):
+            cell.set("t", "str")
+            v = ET.SubElement(cell, v_tag)
+            v.text = value
+        elif value is None or value == "":
+            cell.attrib.pop("t", None)
+            v = ET.SubElement(cell, v_tag)
+            v.text = ""
+        else:
+            cell.attrib.pop("t", None)
+            v = ET.SubElement(cell, v_tag)
+            if isinstance(value, bool):
+                v.text = "1" if value else "0"
+            elif isinstance(value, (int, float)) and float(value).is_integer():
+                v.text = str(int(value))
+            else:
+                v.text = str(value)
+
     def save_bytes(self) -> bytes:
         # Pedir recálculo completo al abrir en Excel.
         wb = ET.fromstring(self.files["xl/workbook.xml"])
@@ -560,6 +590,9 @@ def _fill_preliminary(x: XlsxTemplatePatcher, payload: dict, a: dict, rf: dict, 
         bac = max(a["total_cases"] - upgd, 0)
     x.set_number(s, "H34", upgd)
     x.set_number(s, "K34", bac)
+    # La plantilla trae una fórmula en N34; actualizamos también su valor visible
+    # para que el informe abra diligenciado incluso antes del recálculo de Excel.
+    x.set_formula_cache(s, "N34", a["total_cases"])
 
     deaths = int(rf.get("casos_muertos", 0) or 0)
     alive = max(a["total_cases"] - deaths, 0)
@@ -599,67 +632,180 @@ def _fill_preliminary(x: XlsxTemplatePatcher, payload: dict, a: dict, rf: dict, 
 
 def _fill_age_sex(x: XlsxTemplatePatcher, a: dict):
     s = "Inf. 72 horas"
+    total_m_exp = total_m_cases = total_f_exp = total_f_cases = 0
     for idx, (label, _, _) in enumerate(AGE_GROUPS, start=49):
         d = a["age_sex"].get(label, {})
-        x.set_number(s, f"F{idx}", d.get("M_exp", 0))
-        x.set_number(s, f"G{idx}", d.get("M_cases", 0))
-        x.set_number(s, f"I{idx}", d.get("F_exp", 0))
-        x.set_number(s, f"K{idx}", d.get("F_cases", 0))
+        m_exp = int(d.get("M_exp", 0) or 0)
+        m_cases = int(d.get("M_cases", 0) or 0)
+        f_exp = int(d.get("F_exp", 0) or 0)
+        f_cases = int(d.get("F_cases", 0) or 0)
+        total_exp = m_exp + f_exp
+        total_cases = m_cases + f_cases
+
+        x.set_number(s, f"F{idx}", m_exp)
+        x.set_number(s, f"G{idx}", m_cases)
+        x.set_number(s, f"I{idx}", f_exp)
+        x.set_number(s, f"K{idx}", f_cases)
+        x.set_formula_cache(s, f"H{idx}", (m_cases / m_exp) if m_exp else "")
+        x.set_formula_cache(s, f"M{idx}", (f_cases / f_exp) if f_exp else "")
+        x.set_formula_cache(s, f"N{idx}", total_exp)
+        x.set_formula_cache(s, f"O{idx}", total_cases)
+        x.set_formula_cache(s, f"P{idx}", (total_cases / total_exp) if total_exp else "")
+
+        total_m_exp += m_exp
+        total_m_cases += m_cases
+        total_f_exp += f_exp
+        total_f_cases += f_cases
+
+    total_exp = total_m_exp + total_f_exp
+    total_cases = total_m_cases + total_f_cases
+    for ref, value in {
+        "F56": total_m_exp, "G56": total_m_cases,
+        "I56": total_f_exp, "K56": total_f_cases,
+        "N56": total_exp, "O56": total_cases,
+    }.items():
+        x.set_formula_cache(s, ref, value)
+    x.set_formula_cache(s, "H56", (total_m_cases / total_m_exp) if total_m_exp else "")
+    x.set_formula_cache(s, "M56", (total_f_cases / total_f_exp) if total_f_exp else "")
+    x.set_formula_cache(s, "P56", (total_cases / total_exp) if total_exp else "")
 
 
 def _fill_curve(x: XlsxTemplatePatcher, a: dict):
     s = "Inf. 72 horas"
-    # El formato original trae intervalos de dos horas entre 0 y 60 h.
+    # El formato oficial trabaja en horas con intervalos de 2 h.
     x.mark(s, "D63", False)
     x.mark(s, "F63", True)
     x.mark(s, "H63", False)
-    for row in range(68, 98):
-        x.set_number(s, f"E{row}", 0)
+
+    frequencies = {row: 0 for row in range(68, 98)}
     inc = a.get("incubation")
-    if not inc:
-        return
-    for hours in inc["values"]:
-        # Filas 68..97 representan: 0-2; 2.1-4; ...; 58.1-60.
-        if 0 <= hours <= 60:
-            bin_idx = min(int(math.ceil(hours / 2.0)) - 1 if hours > 0 else 0, 29)
-            row = 68 + bin_idx
-            # La plantilla se recalculará; acumulamos aquí el valor de entrada.
-            # Como el patcher no lee valores, acumulamos temporalmente en atributo externo.
-            key = f"_freq_{row}"
-            current = getattr(x, key, 0)
-            setattr(x, key, current + 1)
+    if inc:
+        for hours in inc["values"]:
+            if 0 <= hours <= 60:
+                bin_idx = min(int(math.ceil(hours / 2.0)) - 1 if hours > 0 else 0, 29)
+                frequencies[68 + bin_idx] += 1
+
+    cumulative = 0
+    weighted_sum = 0.0
     for row in range(68, 98):
-        x.set_number(s, f"E{row}", getattr(x, f"_freq_{row}", 0))
+        freq = frequencies[row]
+        midpoint = 1 + (row - 68) * 2 if row == 68 else 3.05 + (row - 69) * 2
+        cumulative += freq
+        weighted = freq * midpoint
+        weighted_sum += weighted
+        x.set_number(s, f"E{row}", freq)
+        x.set_formula_cache(s, f"G{row}", weighted)
+        x.set_formula_cache(s, f"H{row}", cumulative)
+
+    # Resumen de intervalos de 6 horas (filas 68-77 del bloque derecho).
+    grouped_cum = 0
+    for i, row in enumerate(range(68, 78)):
+        start = 68 + i * 3
+        grouped = sum(frequencies.get(r, 0) for r in range(start, min(start + 3, 98)))
+        grouped_cum += grouped
+        mid = 3 + i * 6 + (0.05 if i else 0)
+        x.set_formula_cache(s, f"O{row}", grouped)
+        x.set_formula_cache(s, f"P{row}", grouped * mid)
+        x.set_formula_cache(s, f"Q{row}", grouped_cum)
+        x.set_formula_cache(s, f"K{row}", grouped_cum)
+
+    x.set_formula_cache(s, "E98", sum(frequencies.values()))
+    x.set_formula_cache(s, "G98", weighted_sum)
+    x.set_formula_cache(s, "I98", "" if sum(frequencies.values()) == a.get("total_cases", 0) else "Error - La suma de los casos NO coincide con el número de casos descrito inicialmente")
+
+    if inc:
+        for ref, val in {
+            "P87": inc["min"], "P88": inc["max"],
+            "P89": inc["mean"], "P90": inc["median"],
+        }.items():
+            x.set(ref=ref, sheet=s, value=round(val, 2))
+        for ref in ("Q87", "Q88", "Q89", "Q90"):
+            x.set_formula_cache(s, ref, "Horas")
+
+        # Valores auxiliares visibles del cálculo de mediana para evitar #N/A al abrir.
+        vals = sorted(inc["values"])
+        n = len(vals)
+        pos = (n - 1) / 2 if n else 0
+        grouped = []
+        for i in range(10):
+            lo = 0 if i == 0 else 6.1 + (i - 1) * 6
+            hi = 6 + i * 6
+            count = sum(1 for v in vals if (0 <= v <= 6 if i == 0 else lo <= v <= hi))
+            grouped.append((lo, hi, count))
+        prev = 0
+        li = 0
+        fpm = 0
+        for lo, hi, cnt in grouped:
+            if prev + cnt >= pos:
+                li = lo
+                fpm = cnt
+                break
+            prev += cnt
+        x.set_formula_cache(s, "P94", pos)
+        x.set_formula_cache(s, "P95", li)
+        x.set_formula_cache(s, "P96", prev)
+        x.set_formula_cache(s, "P97", fpm)
+        for ref in ("Q94", "Q95", "Q96", "Q97"):
+            x.set_formula_cache(s, ref, "Horas")
+    else:
+        for ref in ("P87", "P88", "P89", "P90", "P94", "P95", "P96", "P97"):
+            x.set(ref=ref, sheet=s, value="")
 
 
-def _fill_food_table(x: XlsxTemplatePatcher, a: dict):
+def _fill_food_table(x: XlsxTemplatePatcher, a: dict, analysis_text: str = ""):
     s = "Inf. 72 horas"
-    # Cohorte: contamos expuestos y no expuestos, enfermos y sanos.
+    # Cohorte: consumidores/no consumidores, enfermos/no enfermos. IC 95 %.
     x.mark(s, "E104", True)
     x.mark(s, "E105", False)
-    # IC 95 %.
     x.mark(s, "N103", False)
     x.mark(s, "N104", True)
     x.mark(s, "N105", False)
+    x.set_formula_cache(s, "P103", 1.96)
+    x.set_formula_cache(s, "N107", "RR")
 
     rows = list(range(110, 125))
     for row in rows:
         for ref in (f"C{row}", f"D{row}", f"E{row}", f"H{row}", f"I{row}"):
             x.set_text(s, ref, "")
+        for ref in (f"F{row}", f"G{row}", f"J{row}", f"K{row}", f"M{row}", f"N{row}", f"P{row}", f"Q{row}", f"R{row}", f"S{row}", f"T{row}"):
+            x.set_formula_cache(s, ref, "")
 
     for row, item in zip(rows, a["food_analysis"][: len(rows)]):
         x.set_text(s, f"C{row}", item["food"])
-        # El Anexo 3 indica sumar 1 a las cuatro celdas cuando alguna es cero.
-        x.set_number(s, f"D{row}", item["input_a"])
-        x.set_number(s, f"E{row}", item["input_b"])
-        x.set_number(s, f"H{row}", item["input_c"])
-        x.set_number(s, f"I{row}", item["input_d"])
+        # Regla explícita del Anexo 3: si hay cero, sumar 1 a las cuatro celdas.
+        aa, bb, cc, dd = item["input_a"], item["input_b"], item["input_c"], item["input_d"]
+        ta_e = item.get("attack_exposed_official")
+        ta_ne = item.get("attack_unexposed_official")
+        diff = item.get("risk_difference_official")
+        x.set_number(s, f"D{row}", aa)
+        x.set_number(s, f"E{row}", bb)
+        x.set_number(s, f"H{row}", cc)
+        x.set_number(s, f"I{row}", dd)
+        x.set_formula_cache(s, f"F{row}", aa + bb)
+        x.set_formula_cache(s, f"G{row}", ta_e if ta_e is not None else "")
+        x.set_formula_cache(s, f"J{row}", cc + dd)
+        x.set_formula_cache(s, f"K{row}", ta_ne if ta_ne is not None else "")
+        x.set_formula_cache(s, f"M{row}", diff if diff is not None else "")
+        x.set_formula_cache(s, f"N{row}", item.get("rr") if item.get("rr") is not None else "")
+        x.set_formula_cache(s, f"P{row}", item.get("rr_low") if item.get("rr_low") is not None else "")
+        x.set_formula_cache(s, f"Q{row}", item.get("rr_high") if item.get("rr_high") is not None else "")
+        # Columnas auxiliares ocultas del formato oficial: evitar errores de caché visibles al recalcular/inspeccionar.
+        x.set_formula_cache(s, f"R{row}", item["food"].upper())
+        x.set_formula_cache(s, f"S{row}", "")
+        x.set_formula_cache(s, f"T{row}", (aa + bb) + (cc + dd))
+
+    if analysis_text:
+        x.set_formula_cache(s, "C127", analysis_text)
 
 
 def _fill_72h(x: XlsxTemplatePatcher, payload: dict, a: dict, rf: dict, sug: dict):
     s = "Inf. 72 horas"
     g = payload.get("general", {})
+    x.set_text(s, "F12", g.get("departamento", ""))
+    x.set_text(s, "F13", g.get("municipio", ""))
+    x.set_text(s, "F14", g.get("localidad", ""))
     x.set_text(s, "G16", _fmt_date(g.get("fecha_investigacion") or g.get("fecha_notificacion")))
+    x.set_text(s, "E19", g.get("lugar_brote", ""))
     x.set_text(s, "E22", rf.get("definicion_caso") or sug["definicion_caso"])
     x.set_text(s, "E24", rf.get("manejo_clinico", ""))
     x.set_text(s, "G30", _fmt_date(a.get("first_onset")))
@@ -670,13 +816,17 @@ def _fill_72h(x: XlsxTemplatePatcher, payload: dict, a: dict, rf: dict, sug: dic
     for row in range(34, 44):
         x.set_text(s, f"C{row}", "")
         x.set_text(s, f"D{row}", "")
-    for row, (name, n, _) in zip(range(34, 44), a["symptom_counts"][:10]):
+        x.set_formula_cache(s, f"F{row}", "")
+        x.set_formula_cache(s, f"G{row}", "")
+    for row, (name, n, pct) in zip(range(34, 44), a["symptom_counts"][:10]):
         x.set_text(s, f"C{row}", name)
         x.set_number(s, f"D{row}", n)
+        x.set_formula_cache(s, f"F{row}", pct / 100.0)
+        x.set_formula_cache(s, f"G{row}", "")
 
     _fill_age_sex(x, a)
     _fill_curve(x, a)
-    _fill_food_table(x, a)
+    _fill_food_table(x, a, rf.get("analisis_resultados") or sug["analisis_resultados"])
 
     # Sección de tasa de exposición: solo se usa cuando no existe grupo de no enfermos.
     for row in range(133, 145):
@@ -685,7 +835,15 @@ def _fill_72h(x: XlsxTemplatePatcher, payload: dict, a: dict, rf: dict, sug: dic
     if a["total_cases"] and not a["noncases"]:
         for row, item in zip(range(133, 145), a["food_analysis"][:12]):
             x.set_text(s, f"C{row}", item["food"])
+            x.set_formula_cache(s, f"D{row}", a["total_cases"])
             x.set_number(s, f"F{row}", item["a"])
+            x.set_formula_cache(s, f"H{row}", a["total_cases"] - item["a"])
+            x.set_formula_cache(s, f"J{row}", (item["a"] / a["total_cases"]) if a["total_cases"] else "")
+            x.set_formula_cache(s, f"M{row}", (item["a"] / (a["total_cases"] - item["a"])) if (a["total_cases"] - item["a"]) else "")
+        x.set_formula_cache(s, "C147", rf.get("analisis_resultados") or sug["analisis_resultados"])
+    else:
+        # Esta sección no aplica cuando sí tenemos enfermos y no enfermos para comparar.
+        x.set_formula_cache(s, "C147", "No aplica: la investigación cuenta con grupo de enfermos y no enfermos; se utiliza la tabla de tasas de ataque de la sección 4.")
 
     # Tipo de establecimiento. Si no coincide con una categoría, marcar Otro.
     place_type = _norm(rf.get("tipo_establecimiento", ""))
@@ -714,8 +872,12 @@ def _fill_72h(x: XlsxTemplatePatcher, payload: dict, a: dict, rf: dict, sug: dic
 def _fill_final(x: XlsxTemplatePatcher, payload: dict, a: dict, rf: dict, sug: dict):
     s = "Inf. final"
     g = payload.get("general", {})
+    x.set_text(s, "F12", g.get("departamento", ""))
+    x.set_text(s, "F13", g.get("municipio", ""))
+    x.set_text(s, "F14", g.get("localidad", ""))
     x.set_text(s, "G16", _fmt_date(rf.get("fecha_agente")))
     x.set_text(s, "G18", _fmt_date(rf.get("fecha_cierre")))
+    x.set_text(s, "E20", g.get("lugar_brote", ""))
     x.set_number(s, "F23", a["total_exposed"])
     x.set_number(s, "J23", a["total_cases"])
     deaths = int(rf.get("casos_muertos", 0) or 0)
