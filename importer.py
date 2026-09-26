@@ -32,6 +32,17 @@ def _truthy(value: Any) -> bool:
     return _norm(value) in {"x", "si", "s", "1", "true", "verdadero", "yes"}
 
 
+def _normalize_sex(value: Any) -> str:
+    n = _norm(value)
+    if n in {"f", "femenino", "femenina", "mujer"}:
+        return "F"
+    if n in {"m", "masculino", "masculina", "hombre"}:
+        return "M"
+    if n in {"otro", "otra", "intersexual", "no binario", "no binaria"}:
+        return "Otro"
+    return _clean(value)
+
+
 def _parse_time(value: Any):
     if value in (None, ""):
         return None
@@ -177,8 +188,8 @@ def _detect_person_layout(ws):
     # Detectar los bloques de estado por los títulos de la fila 9. Esto permite leer
     # tanto el formato con U:X como el formato ampliado con AA:AD.
     enfermo_col = _find_header_col(ws, 9, ("enfermo",))
-    consulta_col = _find_header_col(ws, 9, ("consulta",))
-    hosp_col = _find_header_col(ws, 9, ("hospitalizado",))
+    consulta_col = _find_header_col(ws, 9, ("consulta", "consulto", "consultó"))
+    hosp_col = _find_header_col(ws, 9, ("hospitalizado", "hospitalizacion", "hospitalización"))
     muestra_col = _find_header_col(ws, 9, ("muestra",))
     if not enfermo_col:
         # Fallback por encabezados Si/No continuos al final del bloque.
@@ -267,7 +278,7 @@ def parse_consumer_excel(file_bytes: bytes) -> dict:
         name = _clean(ws1.cell(row, p_layout["name"]).value)
         ident = _clean(ws1.cell(row, p_layout["id"]).value)
         age = ws1.cell(row, p_layout["age"]).value
-        sex = _clean(ws1.cell(row, p_layout["sex"]).value)
+        sex = _normalize_sex(ws1.cell(row, p_layout["sex"]).value)
         address = _clean(ws1.cell(row, p_layout["address"]).value)
         symptom_date = _parse_date(ws1.cell(row, p_layout["day"]).value, base_date)
         symptom_time = _parse_time(ws1.cell(row, p_layout["hour"]).value)

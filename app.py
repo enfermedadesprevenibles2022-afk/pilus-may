@@ -84,6 +84,10 @@ def init_state():
         st.session_state.report_fields = {}
     if "module" not in st.session_state:
         st.session_state.module = MODULES[0]
+    if "capture_mode" not in st.session_state:
+        st.session_state.capture_mode = "none"  # none | excel | manual
+    if "imported_source_name" not in st.session_state:
+        st.session_state.imported_source_name = ""
 
 
 def resize_records(n: int):
@@ -95,6 +99,21 @@ def resize_records(n: int):
         st.session_state.people = st.session_state.people[:n]
         st.session_state.consumptions = st.session_state.consumptions[:n]
     st.session_state.num_personas = n
+
+
+def reset_capture_records(n: int = 15):
+    """Inicia una captura manual nueva sin mezclarla con un Excel importado."""
+    n = max(1, min(int(n), MAX_PERSONAS))
+    st.session_state.num_personas = n
+    st.session_state.people = [empty_person() for _ in range(n)]
+    st.session_state.consumptions = [empty_consumption() for _ in range(n)]
+    st.session_state.symptoms = DEFAULT_SYMPTOMS.copy()
+    st.session_state.foods = []
+    st.session_state.report_fields = {}
+    st.session_state.capture_mode = "manual"
+    st.session_state.imported_source_name = ""
+    for key in ["generated", "last_import", "import_preview", "import_preview_key", "import_preview_name"]:
+        st.session_state.pop(key, None)
 
 
 def active_count():
@@ -211,6 +230,7 @@ def apply_import(parsed: dict, mode: str) -> dict:
         if value not in (None, ""):
             st.session_state.general[key] = value
 
+    st.session_state.capture_mode = "excel"
     st.session_state.pop("generated", None)
     return {"added": added, "duplicates": duplicates, "total": active_count()}
 
@@ -221,8 +241,15 @@ st.title("📋 APP ETA - Investigación de brotes y Encuesta de Consumidores")
 st.caption("Dos formas de captura: importar el Anexo 2 ya diligenciado o realizar las encuestas directamente en campo desde la app.")
 
 page = st.sidebar.radio("Módulos", MODULES, key="module")
-st.sidebar.metric("Cupos habilitados", st.session_state.num_personas)
-st.sidebar.metric("Encuestas diligenciadas", active_count())
+mode_label = {"excel": "📤 Excel importado", "manual": "🧑‍⚕️ Encuesta manual", "none": "Sin modo seleccionado"}[st.session_state.capture_mode]
+st.sidebar.info(f"Modo actual: **{mode_label}**")
+if st.session_state.capture_mode == "excel":
+    st.sidebar.metric("Personas importadas", active_count())
+    if st.session_state.imported_source_name:
+        st.sidebar.caption(f"Archivo: {st.session_state.imported_source_name}")
+else:
+    st.sidebar.metric("Cupos habilitados", st.session_state.num_personas)
+    st.sidebar.metric("Encuestas diligenciadas", active_count())
 st.sidebar.caption("Máximo: 100 personas por investigación.")
 
 if page == "1. Inicio / Importar":
@@ -235,7 +262,11 @@ if page == "1. Inicio / Importar":
     with right:
         st.subheader("🧑‍⚕️ Opción B — Encuestar en la app")
         st.write("Ideal para trabajo de campo. Registras **una persona a la vez**, incluidos síntomas y consumo de alimentos de los tres periodos del Anexo 2.")
-        st.success("Para iniciar en campo, selecciona **2. Encuesta en campo** en el menú lateral.")
+        if st.button("🧑‍⚕️ Iniciar captura manual nueva", width="stretch"):
+            reset_capture_records(15)
+            st.session_state.module = "2. Encuesta en campo"
+            st.rerun()
+        st.caption("Este modo es independiente del modo Excel: aquí sí se diligencia persona por persona.")
 
     st.divider()
     st.subheader("Importar Encuesta de Consumidores")
@@ -274,22 +305,26 @@ if page == "1. Inicio / Importar":
                 } for i, p in enumerate(parsed["people"])]
                 st.dataframe(preview_rows, hide_index=True, width="stretch")
 
-            mode = st.radio(
-                "¿Qué deseas hacer con los datos cargados?",
-                ["Reemplazar registros actuales", "Agregar sin duplicar"],
-                horizontal=True,
+            st.info(
+                "Al confirmar, este Excel se tomará como la **fuente completa de la investigación**: "
+                "la pestaña 1 aporta personas, condición clínica y síntomas; la pestaña 2 aporta los alimentos y consumos. "
+                "No tendrás que rediligenciar registros manualmente."
             )
-            if st.button("✅ Incorporar Excel a la investigación", type="primary", width="stretch"):
+            mode = "Reemplazar registros actuales"
+            if st.button("✅ Cargar las dos pestañas y continuar", type="primary", width="stretch"):
                 result = apply_import(parsed, mode)
                 st.session_state.last_import = {
                     "archivo": uploaded.name,
-                    "modo": mode,
+                    "modo": "Excel completo (2 pestañas)",
                     **result,
                 }
+                st.session_state.imported_source_name = uploaded.name
+                st.session_state.module = "4. Revisar registros"
                 st.success(
-                    f"Excel incorporado. Se agregaron {result['added']} personas; "
-                    f"duplicados omitidos: {result['duplicates']}. Total diligenciado: {result['total']}."
+                    f"Excel incorporado. Se leyeron las dos pestañas del Anexo 2 y quedaron cargadas "
+                    f"{result['total']} personas. No debes volver a diligenciarlas una a una."
                 )
+                st.rerun()
 
     if st.session_state.get("last_import"):
         li = st.session_state.last_import
@@ -297,7 +332,41 @@ if page == "1. Inicio / Importar":
 
 elif page == "2. Encuesta en campo":
     st.header("2. Encuesta de Consumidores en campo")
-    st.write("Diligencia una persona a la vez. Al guardar, la encuesta queda integrada con cualquier Excel que hayas importado.")
+
+    if st.session_state.capture_mode == "excel":
+        st.success(
+            "Esta investigación está en **modo Excel importado**. La app ya tomó la información de las dos pestañas "
+            "del Anexo 2 (personas/síntomas y alimentos/consumos). **No tienes que volver a diligenciar cada persona.**"
+        )
+        a = analyze(consumer_payload())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Personas importadas", a["total_exposed"])
+        c2.metric("Enfermos", a["total_cases"])
+        c3.metric("Tasa de ataque", f"{a['attack_rate']:.1f}%")
+        b1, b2 = st.columns(2)
+        if b1.button("👥 Ir a revisar registros", type="primary", width="stretch"):
+            st.session_state.module = "4. Revisar registros"
+            st.rerun()
+        if b2.button("📊 Ir a informes y análisis", width="stretch"):
+            st.session_state.module = "5. Informes y análisis"
+            st.rerun()
+        with st.expander("¿Necesitas comenzar una investigación manual diferente?"):
+            st.warning("Esto inicia una captura manual nueva y separada. No mezcla ni obliga a editar el Excel importado persona por persona.")
+            if st.button("Iniciar investigación manual nueva", key="switch_manual_from_excel"):
+                reset_capture_records(15)
+                st.session_state.module = "2. Encuesta en campo"
+                st.rerun()
+    else:
+        if st.session_state.capture_mode == "none":
+            st.info("Para trabajo de campo, inicia primero el **modo manual** desde 1. Inicio / Importar.")
+            if st.button("🧑‍⚕️ Iniciar modo manual ahora", type="primary"):
+                reset_capture_records(15)
+                st.rerun()
+        else:
+            st.write("Modo manual: diligencia una persona a la vez y guarda cada encuesta.")
+
+    if st.session_state.capture_mode != "manual":
+        st.stop()
 
     if not st.session_state.foods:
         st.warning("Aún no has definido alimentos a investigar. Puedes registrar la persona y los síntomas, pero para seleccionar alimentos ve a **3. Configuración** y agrega el listado del brote.")
@@ -394,9 +463,15 @@ elif page == "2. Encuesta en campo":
 
 elif page == "3. Configuración":
     st.header("3. Datos generales y variables de la investigación")
+    excel_locked = st.session_state.capture_mode == "excel"
+    if excel_locked:
+        st.info(
+            "Modo Excel: las personas, síntomas y alimentos provienen del archivo importado y quedan bloqueados aquí "
+            "para evitar modificar accidentalmente la encuesta. Puedes completar los datos generales del brote."
+        )
     with st.form("config_form"):
         c1, c2, c3 = st.columns(3)
-        n = c1.number_input("Cupos de personas habilitados", 1, MAX_PERSONAS, st.session_state.num_personas, 1)
+        n = c1.number_input("Cupos de personas habilitados", 1, MAX_PERSONAS, st.session_state.num_personas, 1, disabled=excel_locked)
         departamento = c2.text_input("Departamento", st.session_state.general.get("departamento", ""))
         municipio = c3.text_input("Municipio", st.session_state.general.get("municipio", ""))
         c4, c5, c6 = st.columns(3)
@@ -417,20 +492,28 @@ elif page == "3. Configuración":
 
         st.subheader("Variables de la encuesta")
         l, rr = st.columns(2)
-        symptom_text = l.text_area(f"Signos y síntomas (máx. {MAX_SINTOMAS})", "\n".join(st.session_state.symptoms), height=220)
+        symptom_text = l.text_area(
+            f"Signos y síntomas (máx. {MAX_SINTOMAS})", "\n".join(st.session_state.symptoms),
+            height=220, disabled=excel_locked,
+        )
         food_text = rr.text_area(
             f"Alimentos a investigar (máx. {MAX_ALIMENTOS})",
             "\n".join(st.session_state.foods),
             height=220,
             placeholder="Un alimento por línea",
+            disabled=excel_locked,
         )
         submitted = st.form_submit_button("💾 Guardar configuración", type="primary", width="stretch")
     if submitted:
-        resize_records(int(n))
-        new_symptoms = parse_list(symptom_text, MAX_SINTOMAS)
-        new_foods = parse_list(food_text, MAX_ALIMENTOS)
-        st.session_state.symptoms = new_symptoms
-        st.session_state.foods = new_foods
+        if excel_locked:
+            new_symptoms = st.session_state.symptoms
+            new_foods = st.session_state.foods
+        else:
+            resize_records(int(n))
+            new_symptoms = parse_list(symptom_text, MAX_SINTOMAS)
+            new_foods = parse_list(food_text, MAX_ALIMENTOS)
+            st.session_state.symptoms = new_symptoms
+            st.session_state.foods = new_foods
         st.session_state.general.update({
             "departamento": departamento, "municipio": municipio, "localidad": localidad,
             "lugar_brote": lugar, "direccion_brote": direccion, "telefono_brote": tel_brote,
@@ -444,10 +527,15 @@ elif page == "3. Configuración":
             for period in PERIODOS:
                 all_cons[period]["selected_foods"] = [x for x in all_cons[period]["selected_foods"] if x in new_foods]
         st.session_state.pop("generated", None)
-        st.success("Configuración guardada.")
+        st.success("Datos generales guardados." if excel_locked else "Configuración guardada.")
 
 elif page == "4. Revisar registros":
     st.header("4. Revisar registros consolidados")
+    if st.session_state.capture_mode == "excel":
+        st.success(
+            f"Datos cargados automáticamente desde **{st.session_state.imported_source_name or 'el Anexo 2'}**. "
+            "Pestaña 1: personas/síntomas. Pestaña 2: alimentos/consumos."
+        )
     payload = consumer_payload()
     a = analyze(payload)
     k1, k2, k3, k4 = st.columns(4)
@@ -472,15 +560,19 @@ elif page == "4. Revisar registros":
             "Hospitalizado": "Sí" if p["Hospitalizado"] else "No",
         })
     st.dataframe(rows, hide_index=True, width="stretch")
-    st.caption("Para corregir una persona, entra a **2. Encuesta en campo** y selecciona su número.")
+    if st.session_state.capture_mode == "excel":
+        st.caption("Datos cargados automáticamente desde las dos pestañas del Excel. Si algo está mal, corrige el archivo fuente y vuelve a importarlo; no es necesario rediligenciar las personas en la app.")
+    else:
+        st.caption("En modo manual, para corregir una persona entra a **2. Encuesta en campo** y selecciona su número.")
 
-    with st.expander("Limpiar una encuesta equivocada", expanded=False):
-        clear_no = st.selectbox("Persona a limpiar", list(range(1, st.session_state.num_personas + 1)), key="clear_person")
-        if st.button("🗑️ Limpiar persona seleccionada"):
-            st.session_state.people[clear_no - 1] = empty_person()
-            st.session_state.consumptions[clear_no - 1] = empty_consumption()
-            st.session_state.pop("generated", None)
-            st.success(f"Se limpiaron los datos de la persona {clear_no}.")
+    if st.session_state.capture_mode == "manual":
+        with st.expander("Limpiar una encuesta equivocada", expanded=False):
+            clear_no = st.selectbox("Persona a limpiar", list(range(1, st.session_state.num_personas + 1)), key="clear_person")
+            if st.button("🗑️ Limpiar persona seleccionada"):
+                st.session_state.people[clear_no - 1] = empty_person()
+                st.session_state.consumptions[clear_no - 1] = empty_consumption()
+                st.session_state.pop("generated", None)
+                st.success(f"Se limpiaron los datos de la persona {clear_no}.")
 
 elif page == "5. Informes y análisis":
     st.header("5. Análisis epidemiológico e informes oficiales")
