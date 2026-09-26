@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import date, time
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -8,15 +7,24 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import streamlit as st
 
 from excel_generator import MAX_ALIMENTOS, MAX_PERSONAS, MAX_SINTOMAS, PERIODOS, build_excel
+from importer import parse_consumer_excel, person_key
 from report_generator import analyze, build_reports
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "plantilla_eta.xlsx"
 ANEXO3_ORIGINAL = BASE_DIR / "Anexo 3.FORMATO_BROTES_ETA_JULIO 2022.xls"
 
-st.set_page_config(page_title="ETA - Investigación de brotes", page_icon="📋", layout="wide")
+st.set_page_config(page_title="APP ETA - Investigación de brotes", page_icon="📋", layout="wide")
 
 DEFAULT_SYMPTOMS = ["Vómito", "Diarrea", "Náuseas", "Dolor abdominal", "Fiebre"]
+MODULES = [
+    "1. Inicio / Importar",
+    "2. Encuesta en campo",
+    "3. Configuración",
+    "4. Revisar registros",
+    "5. Informes y análisis",
+    "6. Descargar",
+]
 
 
 def parse_list(text: str, maximum: int) -> list[str]:
@@ -74,9 +82,12 @@ def init_state():
         }
     if "report_fields" not in st.session_state:
         st.session_state.report_fields = {}
+    if "module" not in st.session_state:
+        st.session_state.module = MODULES[0]
 
 
 def resize_records(n: int):
+    n = max(1, min(int(n), MAX_PERSONAS))
     while len(st.session_state.people) < n:
         st.session_state.people.append(empty_person())
         st.session_state.consumptions.append(empty_consumption())
@@ -84,6 +95,27 @@ def resize_records(n: int):
         st.session_state.people = st.session_state.people[:n]
         st.session_state.consumptions = st.session_state.consumptions[:n]
     st.session_state.num_personas = n
+
+
+def active_count():
+    return sum(1 for p in st.session_state.people if p["Nombres y apellidos"].strip() or p["Identificación"].strip())
+
+
+def first_empty_index() -> int:
+    for i, p in enumerate(st.session_state.people, start=1):
+        if not (p["Nombres y apellidos"].strip() or p["Identificación"].strip()):
+            return i
+    return st.session_state.num_personas
+
+
+def union_keep_order(a: list[str], b: list[str], maximum: int) -> list[str]:
+    out, seen = [], set()
+    for item in list(a) + list(b):
+        text = str(item).strip()
+        if text and text.casefold() not in seen:
+            seen.add(text.casefold())
+            out.append(text)
+    return out[:maximum]
 
 
 def consumer_payload():
@@ -120,33 +152,251 @@ def consumer_payload():
     g = st.session_state.general.copy()
     for k in ["fecha_ocurrencia", "fecha_deteccion", "fecha_notificacion", "fecha_investigacion"]:
         g[k] = fmt_date(g.get(k))
-    return {"general": g, "symptoms": st.session_state.symptoms, "foods": st.session_state.foods,
-            "persons": persons, "food_rows": food_rows}
+    return {
+        "general": g,
+        "symptoms": st.session_state.symptoms,
+        "foods": st.session_state.foods,
+        "persons": persons,
+        "food_rows": food_rows,
+    }
 
 
-def active_count():
-    return sum(1 for p in st.session_state.people if p["Nombres y apellidos"].strip() or p["Identificación"].strip())
+def apply_import(parsed: dict, mode: str) -> dict:
+    imported_people = parsed.get("people", [])[:MAX_PERSONAS]
+    imported_cons = parsed.get("consumptions", [])[:len(imported_people)]
+    imported_symptoms = parsed.get("symptoms", [])
+    imported_foods = parsed.get("foods", [])
+
+    # Conservar variables detectadas en el Excel para que las X importadas sigan teniendo significado.
+    if mode == "Reemplazar registros actuales":
+        st.session_state.symptoms = imported_symptoms or st.session_state.symptoms
+        st.session_state.foods = imported_foods or st.session_state.foods
+        st.session_state.people = [dict(p) for p in imported_people]
+        st.session_state.consumptions = [dict(c) for c in imported_cons]
+        n = max(1, len(imported_people))
+        resize_records(n)
+        added = len(imported_people)
+        duplicates = 0
+    else:
+        st.session_state.symptoms = union_keep_order(st.session_state.symptoms, imported_symptoms, MAX_SINTOMAS)
+        st.session_state.foods = union_keep_order(st.session_state.foods, imported_foods, MAX_ALIMENTOS)
+
+        existing_pairs = [
+            (p, st.session_state.consumptions[i])
+            for i, p in enumerate(st.session_state.people)
+            if p["Nombres y apellidos"].strip() or p["Identificación"].strip()
+        ]
+        seen = {person_key(p) for p, _ in existing_pairs if person_key(p)}
+        added = duplicates = 0
+        for p, c in zip(imported_people, imported_cons):
+            key = person_key(p)
+            if key and key in seen:
+                duplicates += 1
+                continue
+            if len(existing_pairs) >= MAX_PERSONAS:
+                break
+            existing_pairs.append((dict(p), dict(c)))
+            if key:
+                seen.add(key)
+            added += 1
+
+        target_n = min(MAX_PERSONAS, max(st.session_state.num_personas, len(existing_pairs), 1))
+        st.session_state.people = [p for p, _ in existing_pairs]
+        st.session_state.consumptions = [c for _, c in existing_pairs]
+        st.session_state.num_personas = len(st.session_state.people)
+        resize_records(target_n)
+
+    # Importar solo valores generales existentes, sin borrar lo ya diligenciado con vacíos.
+    for key, value in parsed.get("general", {}).items():
+        if value not in (None, ""):
+            st.session_state.general[key] = value
+
+    st.session_state.pop("generated", None)
+    return {"added": added, "duplicates": duplicates, "total": active_count()}
 
 
 init_state()
 
-st.title("📋 Investigación de brotes de Enfermedades Transmitidas por Alimentos - ETA")
-st.caption("Versión optimizada: hasta 100 personas, calendarios, guardado por bloques y generación de encuesta + informes 24 h, 72 h y final.")
+st.title("📋 APP ETA - Investigación de brotes y Encuesta de Consumidores")
+st.caption("Dos formas de captura: importar el Anexo 2 ya diligenciado o realizar las encuestas directamente en campo desde la app.")
 
-# Navegación simple y rápida
-page = st.sidebar.radio(
-    "Módulos",
-    ["1. Configuración", "2. Personas", "3. Consumo de alimentos", "4. Informes y análisis", "5. Descargar"],
-)
-st.sidebar.metric("Personas configuradas", st.session_state.num_personas)
-st.sidebar.metric("Personas diligenciadas", active_count())
-st.sidebar.caption("Los formularios solo recalculan la app al pulsar Guardar, evitando los bloqueos de la versión anterior.")
+page = st.sidebar.radio("Módulos", MODULES, key="module")
+st.sidebar.metric("Cupos habilitados", st.session_state.num_personas)
+st.sidebar.metric("Encuestas diligenciadas", active_count())
+st.sidebar.caption("Máximo: 100 personas por investigación.")
 
-if page == "1. Configuración":
-    st.header("1. Datos generales y configuración")
+if page == "1. Inicio / Importar":
+    st.header("1. ¿Cómo quieres ingresar la información?")
+    left, right = st.columns(2)
+    with left:
+        st.subheader("📤 Opción A — Cargar Excel")
+        st.write("Carga una **Encuesta de Consumidores (Anexo 2) en .xlsx** que ya esté diligenciada. La app leerá las dos pestañas, personas, síntomas y alimentos.")
+        st.info("Puedes reemplazar los registros actuales o agregar el Excel a las encuestas que ya llevas en la app. Al agregar, se revisan duplicados por identificación y, si no existe, por nombre.")
+    with right:
+        st.subheader("🧑‍⚕️ Opción B — Encuestar en la app")
+        st.write("Ideal para trabajo de campo. Registras **una persona a la vez**, incluidos síntomas y consumo de alimentos de los tres periodos del Anexo 2.")
+        st.success("Para iniciar en campo, selecciona **2. Encuesta en campo** en el menú lateral.")
+
+    st.divider()
+    st.subheader("Importar Encuesta de Consumidores")
+    uploaded = st.file_uploader("Selecciona el Anexo 2 diligenciado", type=["xlsx"], help="Debe ser el formato de Encuesta de Consumidores con sus dos pestañas.")
+    if uploaded is not None:
+        upload_key = f"{uploaded.name}:{uploaded.size}"
+        if st.session_state.get("import_preview_key") != upload_key:
+            try:
+                st.session_state.import_preview = parse_consumer_excel(uploaded.getvalue())
+                st.session_state.import_preview_key = upload_key
+                st.session_state.import_preview_name = uploaded.name
+            except Exception as exc:
+                st.session_state.import_preview = None
+                st.error(str(exc))
+
+        parsed = st.session_state.get("import_preview")
+        if parsed:
+            pcases = sum(1 for p in parsed["people"] if p.get("Enfermo"))
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Personas encontradas", len(parsed["people"]))
+            m2.metric("Enfermos", pcases)
+            m3.metric("Síntomas detectados", len(parsed["symptoms"]))
+            m4.metric("Alimentos detectados", len(parsed["foods"]))
+            if parsed.get("warnings"):
+                for w in parsed["warnings"]:
+                    st.warning(w)
+
+            with st.expander("Vista previa de personas", expanded=False):
+                preview_rows = [{
+                    "No.": i + 1,
+                    "Nombre": p["Nombres y apellidos"],
+                    "Identificación": p["Identificación"],
+                    "Edad": p["Edad"],
+                    "Sexo": p["Sexo"],
+                    "Enfermo": "Sí" if p["Enfermo"] else "No",
+                } for i, p in enumerate(parsed["people"])]
+                st.dataframe(preview_rows, hide_index=True, width="stretch")
+
+            mode = st.radio(
+                "¿Qué deseas hacer con los datos cargados?",
+                ["Reemplazar registros actuales", "Agregar sin duplicar"],
+                horizontal=True,
+            )
+            if st.button("✅ Incorporar Excel a la investigación", type="primary", width="stretch"):
+                result = apply_import(parsed, mode)
+                st.session_state.last_import = {
+                    "archivo": uploaded.name,
+                    "modo": mode,
+                    **result,
+                }
+                st.success(
+                    f"Excel incorporado. Se agregaron {result['added']} personas; "
+                    f"duplicados omitidos: {result['duplicates']}. Total diligenciado: {result['total']}."
+                )
+
+    if st.session_state.get("last_import"):
+        li = st.session_state.last_import
+        st.caption(f"Última importación: {li['archivo']} — {li['modo']} — total actual: {li['total']} personas.")
+
+elif page == "2. Encuesta en campo":
+    st.header("2. Encuesta de Consumidores en campo")
+    st.write("Diligencia una persona a la vez. Al guardar, la encuesta queda integrada con cualquier Excel que hayas importado.")
+
+    if not st.session_state.foods:
+        st.warning("Aún no has definido alimentos a investigar. Puedes registrar la persona y los síntomas, pero para seleccionar alimentos ve a **3. Configuración** y agrega el listado del brote.")
+
+    target = int(st.session_state.pop("field_nav_target", first_empty_index()))
+    target = max(1, min(target, st.session_state.num_personas))
+    person_no = st.selectbox(
+        "Encuesta / persona a diligenciar",
+        list(range(1, st.session_state.num_personas + 1)),
+        index=target - 1,
+        format_func=lambda x: f"Persona {x} — {st.session_state.people[x-1]['Nombres y apellidos'] or st.session_state.people[x-1]['Identificación'] or 'NUEVA'}",
+    )
+    idx = person_no - 1
+    p = st.session_state.people[idx]
+    cons = st.session_state.consumptions[idx]
+
+    with st.form(f"field_survey_{person_no}"):
+        st.subheader(f"Identificación — Persona {person_no}")
+        c1, c2, c3, c4 = st.columns([2, 1.2, .7, .8])
+        name = c1.text_input("Nombres y apellidos", p["Nombres y apellidos"])
+        ident = c2.text_input("Identificación", p["Identificación"])
+        age = c3.text_input("Edad", str(p["Edad"]))
+        sex_options = ["", "F", "M", "Otro"]
+        sex = c4.selectbox("Sexo", sex_options, index=sex_options.index(p["Sexo"]) if p["Sexo"] in sex_options else 0)
+        address = st.text_input("Dirección y teléfono", p["Dirección y teléfono"])
+
+        st.subheader("Condición clínica")
+        q1, q2, q3 = st.columns(3)
+        sick = q1.checkbox("Enfermo", p["Enfermo"])
+        consult = q2.checkbox("Consultó", p["Consulta"])
+        hosp = q3.checkbox("Hospitalizado", p["Hospitalizado"])
+        d1, d2 = st.columns(2)
+        symptom_date = d1.date_input("Fecha de inicio de síntomas", value=p["Día síntomas"], format="DD/MM/YYYY")
+        symptom_time = d2.time_input("Hora de inicio de síntomas", value=p["Hora síntomas"], step=300)
+        selected_symptoms = st.multiselect(
+            "Signos y síntomas",
+            st.session_state.symptoms,
+            default=[x for x in p["selected_symptoms"] if x in st.session_state.symptoms],
+        )
+        sample = st.text_input("Muestra tomada / tipo de muestra", p["Muestra"])
+
+        st.subheader("Consumo de alimentos")
+        st.caption("Registra los tres periodos del Anexo 2 para esta misma persona.")
+        new_cons = {}
+        for pno, period in enumerate(PERIODOS):
+            old = cons[period]
+            with st.expander(period, expanded=(pno == 0)):
+                c1, c2, c3 = st.columns([1, 1, 2])
+                food_date = c1.date_input("Fecha", value=old["Día"], format="DD/MM/YYYY", key=f"field_fd_{person_no}_{pno}")
+                food_time = c2.time_input("Hora", value=old["Hora"], step=300, key=f"field_ft_{person_no}_{pno}")
+                place = c3.text_input("Lugar de consumo", old["Lugar de consumo"], key=f"field_fp_{person_no}_{pno}")
+                selected_foods = st.multiselect(
+                    "Alimentos consumidos",
+                    st.session_state.foods,
+                    default=[x for x in old["selected_foods"] if x in st.session_state.foods],
+                    key=f"field_ff_{person_no}_{pno}",
+                )
+                new_cons[period] = {
+                    "Día": food_date,
+                    "Hora": food_time,
+                    "Lugar de consumo": place,
+                    "selected_foods": selected_foods,
+                }
+
+        b1, b2 = st.columns(2)
+        save = b1.form_submit_button("💾 Guardar encuesta", type="primary", width="stretch")
+        save_next = b2.form_submit_button("💾 Guardar y continuar con la siguiente", width="stretch")
+
+    if save or save_next:
+        st.session_state.people[idx] = {
+            "Nombres y apellidos": name,
+            "Identificación": ident,
+            "Edad": age,
+            "Sexo": sex,
+            "Dirección y teléfono": address,
+            "Día síntomas": symptom_date,
+            "Hora síntomas": symptom_time,
+            "selected_symptoms": selected_symptoms,
+            "Enfermo": sick,
+            "Consulta": consult,
+            "Hospitalizado": hosp,
+            "Muestra": sample,
+        }
+        st.session_state.consumptions[idx] = new_cons
+        st.session_state.pop("generated", None)
+        if save_next:
+            if person_no == st.session_state.num_personas and st.session_state.num_personas < MAX_PERSONAS:
+                resize_records(st.session_state.num_personas + 1)
+            st.session_state.field_nav_target = min(person_no + 1, st.session_state.num_personas)
+            st.success(f"Persona {person_no} guardada. Abriendo la siguiente encuesta...")
+            st.rerun()
+        else:
+            st.success(f"Encuesta de la persona {person_no} guardada correctamente.")
+
+elif page == "3. Configuración":
+    st.header("3. Datos generales y variables de la investigación")
     with st.form("config_form"):
         c1, c2, c3 = st.columns(3)
-        n = c1.number_input("Número máximo de personas de este brote", 1, MAX_PERSONAS, st.session_state.num_personas, 1)
+        n = c1.number_input("Cupos de personas habilitados", 1, MAX_PERSONAS, st.session_state.num_personas, 1)
         departamento = c2.text_input("Departamento", st.session_state.general.get("departamento", ""))
         municipio = c3.text_input("Municipio", st.session_state.general.get("municipio", ""))
         c4, c5, c6 = st.columns(3)
@@ -167,14 +417,20 @@ if page == "1. Configuración":
 
         st.subheader("Variables de la encuesta")
         l, rr = st.columns(2)
-        symptom_text = l.text_area(f"Signos y síntomas (máx. {MAX_SINTOMAS})", "\n".join(st.session_state.symptoms), height=180)
-        food_text = rr.text_area(f"Alimentos a investigar (máx. {MAX_ALIMENTOS})", "\n".join(st.session_state.foods), height=180,
-                                 placeholder="Un alimento por línea")
-        submitted = st.form_submit_button("💾 Guardar configuración", type="primary", use_container_width=True)
+        symptom_text = l.text_area(f"Signos y síntomas (máx. {MAX_SINTOMAS})", "\n".join(st.session_state.symptoms), height=220)
+        food_text = rr.text_area(
+            f"Alimentos a investigar (máx. {MAX_ALIMENTOS})",
+            "\n".join(st.session_state.foods),
+            height=220,
+            placeholder="Un alimento por línea",
+        )
+        submitted = st.form_submit_button("💾 Guardar configuración", type="primary", width="stretch")
     if submitted:
         resize_records(int(n))
-        st.session_state.symptoms = parse_list(symptom_text, MAX_SINTOMAS)
-        st.session_state.foods = parse_list(food_text, MAX_ALIMENTOS)
+        new_symptoms = parse_list(symptom_text, MAX_SINTOMAS)
+        new_foods = parse_list(food_text, MAX_ALIMENTOS)
+        st.session_state.symptoms = new_symptoms
+        st.session_state.foods = new_foods
         st.session_state.general.update({
             "departamento": departamento, "municipio": municipio, "localidad": localidad,
             "lugar_brote": lugar, "direccion_brote": direccion, "telefono_brote": tel_brote,
@@ -182,95 +438,52 @@ if page == "1. Configuración":
             "fecha_ocurrencia": fecha_oc, "fecha_deteccion": fecha_det,
             "fecha_notificacion": fecha_not, "fecha_investigacion": fecha_inv,
         })
-        # Eliminar selecciones que ya no estén en las variables configuradas.
-        for p in st.session_state.people:
-            p["selected_symptoms"] = [x for x in p["selected_symptoms"] if x in st.session_state.symptoms]
-        for cons in st.session_state.consumptions:
+        for person in st.session_state.people:
+            person["selected_symptoms"] = [x for x in person["selected_symptoms"] if x in new_symptoms]
+        for all_cons in st.session_state.consumptions:
             for period in PERIODOS:
-                cons[period]["selected_foods"] = [x for x in cons[period]["selected_foods"] if x in st.session_state.foods]
-        st.success("Configuración guardada. Los calendarios ya están activos.")
+                all_cons[period]["selected_foods"] = [x for x in all_cons[period]["selected_foods"] if x in new_foods]
+        st.session_state.pop("generated", None)
+        st.success("Configuración guardada.")
 
-elif page == "2. Personas":
-    st.header("2. Personas, signos y síntomas")
-    page_size = 10
-    total_blocks = (st.session_state.num_personas + page_size - 1) // page_size
-    block = st.selectbox("Bloque de personas", list(range(1, total_blocks + 1)), format_func=lambda x: f"Personas {(x-1)*page_size+1} a {min(x*page_size, st.session_state.num_personas)}")
-    start = (block - 1) * page_size
-    end = min(start + page_size, st.session_state.num_personas)
-    st.info("Completa este bloque y pulsa **Guardar bloque**. Cambiar una casilla o una fecha ya no recarga toda la aplicación.")
-    with st.form(f"people_{block}"):
-        new_rows = []
-        for idx in range(start, end):
-            p = st.session_state.people[idx]
-            with st.expander(f"Persona {idx+1} — {p['Nombres y apellidos'] or p['Identificación'] or 'sin diligenciar'}", expanded=(idx == start)):
-                c1, c2, c3, c4 = st.columns([2, 1.2, .7, .8])
-                name = c1.text_input("Nombres y apellidos", p["Nombres y apellidos"], key=f"name_{block}_{idx}")
-                ident = c2.text_input("Identificación", p["Identificación"], key=f"id_{block}_{idx}")
-                age = c3.text_input("Edad", str(p["Edad"]), key=f"age_{block}_{idx}")
-                sex_options = ["", "F", "M", "Otro"]
-                sex = c4.selectbox("Sexo", sex_options, index=sex_options.index(p["Sexo"]) if p["Sexo"] in sex_options else 0, key=f"sex_{block}_{idx}")
-                address = st.text_input("Dirección y teléfono", p["Dirección y teléfono"], key=f"addr_{block}_{idx}")
-                d1, d2 = st.columns(2)
-                symptom_date = d1.date_input("Fecha de inicio de síntomas", value=p["Día síntomas"], format="DD/MM/YYYY", key=f"date_{block}_{idx}")
-                symptom_time = d2.time_input("Hora de inicio de síntomas", value=p["Hora síntomas"], step=300, key=f"time_{block}_{idx}")
-                selected = st.multiselect("Signos y síntomas", st.session_state.symptoms, default=[x for x in p["selected_symptoms"] if x in st.session_state.symptoms], key=f"sym_{block}_{idx}")
-                q1, q2, q3 = st.columns(3)
-                sick = q1.checkbox("Enfermo", p["Enfermo"], key=f"sick_{block}_{idx}")
-                consult = q2.checkbox("Consultó", p["Consulta"], key=f"consult_{block}_{idx}")
-                hosp = q3.checkbox("Hospitalizado", p["Hospitalizado"], key=f"hosp_{block}_{idx}")
-                sample = st.text_input("Muestra tomada / tipo de muestra", p["Muestra"], key=f"sample_{block}_{idx}")
-                new_rows.append({
-                    "Nombres y apellidos": name, "Identificación": ident, "Edad": age, "Sexo": sex,
-                    "Dirección y teléfono": address, "Día síntomas": symptom_date, "Hora síntomas": symptom_time,
-                    "selected_symptoms": selected, "Enfermo": sick, "Consulta": consult,
-                    "Hospitalizado": hosp, "Muestra": sample,
-                })
-        save = st.form_submit_button("💾 Guardar bloque de personas", type="primary", use_container_width=True)
-    if save:
-        for offset, row in enumerate(new_rows):
-            st.session_state.people[start + offset] = row
-        st.success(f"Personas {start+1} a {end} guardadas.")
+elif page == "4. Revisar registros":
+    st.header("4. Revisar registros consolidados")
+    payload = consumer_payload()
+    a = analyze(payload)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Personas diligenciadas", a["total_exposed"])
+    k2.metric("Enfermos", a["total_cases"])
+    k3.metric("No enfermos", max(0, a["total_exposed"] - a["total_cases"]))
+    k4.metric("Tasa de ataque", f"{a['attack_rate']:.1f}%")
 
-elif page == "3. Consumo de alimentos":
-    st.header("3. Consumo de alimentos")
-    if not st.session_state.foods:
-        st.warning("Primero define los alimentos en **1. Configuración**.")
-    else:
-        page_size = 5
-        total_blocks = (st.session_state.num_personas + page_size - 1) // page_size
-        block = st.selectbox("Bloque de consumo", list(range(1, total_blocks + 1)), format_func=lambda x: f"Personas {(x-1)*page_size+1} a {min(x*page_size, st.session_state.num_personas)}")
-        start = (block - 1) * page_size
-        end = min(start + page_size, st.session_state.num_personas)
-        st.info("Por cada persona aparecen los tres periodos del Anexo 2. Usa el calendario, la hora y selecciona los alimentos consumidos.")
-        with st.form(f"food_{block}"):
-            saved = []
-            for idx in range(start, end):
-                person = st.session_state.people[idx]
-                title = f"Persona {idx+1} — {person['Nombres y apellidos'] or person['Identificación'] or 'sin diligenciar'}"
-                with st.expander(title, expanded=(idx == start)):
-                    person_out = {}
-                    for pno, period in enumerate(PERIODOS):
-                        c = st.session_state.consumptions[idx][period]
-                        st.markdown(f"**{period}**")
-                        c1, c2, c3 = st.columns([1, 1, 2])
-                        d = c1.date_input("Fecha", value=c["Día"], format="DD/MM/YYYY", key=f"fd_{block}_{idx}_{pno}")
-                        t = c2.time_input("Hora", value=c["Hora"], step=300, key=f"ft_{block}_{idx}_{pno}")
-                        place = c3.text_input("Lugar de consumo", c["Lugar de consumo"], key=f"fp_{block}_{idx}_{pno}")
-                        selected = st.multiselect("Alimentos consumidos", st.session_state.foods,
-                                                  default=[x for x in c["selected_foods"] if x in st.session_state.foods],
-                                                  key=f"ff_{block}_{idx}_{pno}")
-                        person_out[period] = {"Día": d, "Hora": t, "Lugar de consumo": place, "selected_foods": selected}
-                        if pno < 2:
-                            st.divider()
-                    saved.append(person_out)
-            save = st.form_submit_button("💾 Guardar bloque de consumos", type="primary", use_container_width=True)
-        if save:
-            for offset, row in enumerate(saved):
-                st.session_state.consumptions[start + offset] = row
-            st.success(f"Consumos de las personas {start+1} a {end} guardados.")
+    rows = []
+    for i, p in enumerate(st.session_state.people, start=1):
+        if not (p["Nombres y apellidos"].strip() or p["Identificación"].strip()):
+            continue
+        rows.append({
+            "No.": i,
+            "Nombres y apellidos": p["Nombres y apellidos"],
+            "Identificación": p["Identificación"],
+            "Edad": p["Edad"],
+            "Sexo": p["Sexo"],
+            "Inicio síntomas": f"{fmt_date(p['Día síntomas'])} {fmt_time(p['Hora síntomas'])}".strip(),
+            "Enfermo": "Sí" if p["Enfermo"] else "No",
+            "Consultó": "Sí" if p["Consulta"] else "No",
+            "Hospitalizado": "Sí" if p["Hospitalizado"] else "No",
+        })
+    st.dataframe(rows, hide_index=True, width="stretch")
+    st.caption("Para corregir una persona, entra a **2. Encuesta en campo** y selecciona su número.")
 
-elif page == "4. Informes y análisis":
-    st.header("4. Informes de 24 horas, 72 horas y final")
+    with st.expander("Limpiar una encuesta equivocada", expanded=False):
+        clear_no = st.selectbox("Persona a limpiar", list(range(1, st.session_state.num_personas + 1)), key="clear_person")
+        if st.button("🗑️ Limpiar persona seleccionada"):
+            st.session_state.people[clear_no - 1] = empty_person()
+            st.session_state.consumptions[clear_no - 1] = empty_consumption()
+            st.session_state.pop("generated", None)
+            st.success(f"Se limpiaron los datos de la persona {clear_no}.")
+
+elif page == "5. Informes y análisis":
+    st.header("5. Informes de 24 horas, 72 horas y final")
     payload = consumer_payload()
     a = analyze(payload)
     k1, k2, k3, k4 = st.columns(4)
@@ -282,17 +495,21 @@ elif page == "4. Informes y análisis":
     with st.expander("Vista rápida del análisis automático", expanded=True):
         st.markdown("**Signos y síntomas**")
         if a["symptom_counts"]:
-            st.dataframe([{"Signo/síntoma": s, "Casos": n, "%": round(p, 1)} for s, n, p in a["symptom_counts"]], hide_index=True, use_container_width=True)
+            st.dataframe(
+                [{"Signo/síntoma": s, "Casos": n, "%": round(pct, 1)} for s, n, pct in a["symptom_counts"]],
+                hide_index=True,
+                width="stretch",
+            )
         st.markdown("**Análisis por alimento**")
         if a["food_analysis"]:
             st.dataframe([{
                 "Alimento": x["food"], "Caso exp.": x["a"], "Sano exp.": x["b"],
                 "Caso no exp.": x["c"], "Sano no exp.": x["d"],
-                "TA exp. %": round((x["attack_exposed"] or 0)*100, 1),
-                "TA no exp. %": round((x["attack_unexposed"] or 0)*100, 1),
+                "TA exp. %": round((x["attack_exposed"] or 0) * 100, 1),
+                "TA no exp. %": round((x["attack_unexposed"] or 0) * 100, 1),
                 "RR*": round(x["rr"], 2) if x["rr"] is not None else None,
                 "OR*": round(x["or"], 2) if x["or"] is not None else None,
-            } for x in a["food_analysis"]], hide_index=True, use_container_width=True)
+            } for x in a["food_analysis"]], hide_index=True, width="stretch")
 
     rf = st.session_state.report_fields
     with st.form("reports_form"):
@@ -331,8 +548,8 @@ elif page == "4. Informes y análisis":
             conf = st.text_area("Conclusiones finales", rf.get("conclusiones_final", ""), height=100)
             plan = st.text_area("Plan de mejoramiento / seguimiento", rf.get("plan_mejoramiento", ""), height=110)
         responsable = st.text_input("Responsable de elaboración de los informes", rf.get("responsable", st.session_state.general.get("encuestador", "")))
-        save = st.form_submit_button("💾 Guardar información de los informes", type="primary", use_container_width=True)
-    if save:
+        save_reports = st.form_submit_button("💾 Guardar información de los informes", type="primary", width="stretch")
+    if save_reports:
         st.session_state.report_fields = {
             "casos_upgd": casos_upgd, "casos_bac": casos_bac, "antecedentes": antecedentes,
             "posibles_alimentos": posibles, "hipotesis_inicial": hip, "medidas_control": medidas,
@@ -349,15 +566,14 @@ elif page == "4. Informes y análisis":
         st.success("Información de los informes guardada.")
 
 else:
-    st.header("5. Generar y descargar")
-    st.write("Los archivos se generan **solo cuando pulsas el botón**, para que la app no se trabe mientras diligencias.")
+    st.header("6. Generar y descargar")
+    st.write("Los archivos se generan solo al pulsar el botón. Tanto los Excel importados como las encuestas realizadas en la app quedan consolidados en el mismo resultado.")
     payload = consumer_payload()
     a = analyze(payload)
     st.info(f"Se usarán {a['total_exposed']} personas diligenciadas, {a['total_cases']} casos y {len(st.session_state.foods)} alimentos definidos.")
 
-    if st.button("⚙️ Generar archivos del brote", type="primary", use_container_width=True):
+    if st.button("⚙️ Generar archivos del brote", type="primary", width="stretch"):
         try:
-            # La encuesta conserva hasta el número configurado de filas; los vacíos no cuentan en los análisis.
             survey_bytes, survey_name = build_excel(payload, TEMPLATE_PATH)
             reports_bytes, reports_name = build_reports(payload, st.session_state.report_fields)
             zip_io = BytesIO()
@@ -374,15 +590,27 @@ else:
     if "generated" in st.session_state:
         survey_bytes, survey_name, reports_bytes, reports_name, zip_bytes = st.session_state.generated
         c1, c2 = st.columns(2)
-        c1.download_button("⬇️ Encuesta de consumidores (Anexo 2)", survey_bytes, survey_name,
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-        c2.download_button("⬇️ Informes 24 h + 72 h + final", reports_bytes, reports_name,
-                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-        st.download_button("📦 Descargar expediente completo", zip_bytes, "ETA_expediente_completo.zip", "application/zip",
-                           type="primary", use_container_width=True)
+        c1.download_button(
+            "⬇️ Encuesta de consumidores (Anexo 2)", survey_bytes, survey_name,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
+        )
+        c2.download_button(
+            "⬇️ Informes 24 h + 72 h + final", reports_bytes, reports_name,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
+        )
+        st.download_button(
+            "📦 Descargar expediente completo", zip_bytes, "ETA_expediente_completo.zip", "application/zip",
+            type="primary", width="stretch",
+        )
         if ANEXO3_ORIGINAL.exists():
-            st.download_button("📄 Descargar Anexo 3 original aportado", ANEXO3_ORIGINAL.read_bytes(), ANEXO3_ORIGINAL.name,
-                               "application/vnd.ms-excel", use_container_width=True)
+            st.download_button(
+                "📄 Descargar Anexo 3 original aportado", ANEXO3_ORIGINAL.read_bytes(), ANEXO3_ORIGINAL.name,
+                "application/vnd.ms-excel", width="stretch",
+            )
 
 st.divider()
-st.caption("Privacidad: la aplicación trabaja localmente. No envía por sí sola identificaciones ni datos clínicos a servicios externos.")
+st.caption(
+    "Privacidad: si ejecutas la app localmente, los datos permanecen en tu equipo durante la sesión. "
+    "Si la publicas en Streamlit Community Cloud, la información se procesa en infraestructura en la nube; "
+    "para datos reales identificables usa únicamente un entorno institucional autorizado y con controles de acceso."
+)
