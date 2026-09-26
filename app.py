@@ -5,6 +5,7 @@ from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import streamlit as st
+from openpyxl import load_workbook
 
 from excel_generator import MAX_ALIMENTOS, MAX_PERSONAS, MAX_SINTOMAS, PERIODOS, build_excel
 from importer import parse_consumer_excel, person_key
@@ -15,6 +16,8 @@ TEMPLATE_PATH = BASE_DIR / "plantilla_eta.xlsx"
 ANEXO3_TEMPLATE = BASE_DIR / "Anexo_3_ETA_OFICIAL.xlsx"
 
 st.set_page_config(page_title="APP ETA - Investigación de brotes", page_icon="📋", layout="wide")
+
+APP_VERSION = "6.4"
 
 DEFAULT_SYMPTOMS = ["Vómito", "Diarrea", "Náuseas", "Dolor abdominal", "Fiebre"]
 MODULES = [
@@ -88,6 +91,10 @@ def init_state():
         st.session_state.capture_mode = "none"  # none | excel | manual
     if "imported_source_name" not in st.session_state:
         st.session_state.imported_source_name = ""
+    # Evita que una sesión conserve un Excel generado por una versión anterior de la app.
+    if st.session_state.get("_app_version") != APP_VERSION:
+        st.session_state.pop("generated", None)
+        st.session_state["_app_version"] = APP_VERSION
 
 
 def resize_records(n: int):
@@ -178,6 +185,34 @@ def consumer_payload():
         "persons": persons,
         "food_rows": food_rows,
     }
+
+
+def validate_generated_report(report_bytes: bytes, analysis: dict) -> tuple[bool, str]:
+    """Verifica que el Anexo 3 generado no sea la plantilla vacía antes de ofrecer la descarga."""
+    try:
+        wb = load_workbook(BytesIO(report_bytes), data_only=False, read_only=False)
+        if "Inf. Preliminar" not in wb.sheetnames or "Inf. 72 horas" not in wb.sheetnames or "Inf. final" not in wb.sheetnames:
+            return False, "El archivo generado no conserva las tres pestañas oficiales del Anexo 3."
+        ws = wb["Inf. Preliminar"]
+        exposed = ws["E34"].value
+        upgd = ws["H34"].value or 0
+        bac = ws["K34"].value or 0
+        expected_exposed = int(analysis.get("total_exposed", 0) or 0)
+        expected_cases = int(analysis.get("total_cases", 0) or 0)
+        try:
+            exposed_ok = int(exposed or 0) == expected_exposed
+            cases_ok = int(upgd or 0) + int(bac or 0) == expected_cases
+        except Exception:
+            return False, "No fue posible validar los totales escritos en el Anexo 3."
+        if not exposed_ok or not cases_ok:
+            return False, (
+                f"Validación fallida: el Anexo 3 contiene {exposed or 0} expuestos y "
+                f"{int(upgd or 0)+int(bac or 0)} casos; la investigación tiene "
+                f"{expected_exposed} expuestos y {expected_cases} casos."
+            )
+        return True, f"Anexo 3 verificado: {expected_exposed} expuestos y {expected_cases} casos escritos en el formato."
+    except Exception as exc:
+        return False, f"No fue posible verificar el Anexo 3 generado: {exc}"
 
 
 def apply_import(parsed: dict, mode: str) -> dict:
@@ -760,19 +795,37 @@ else:
         try:
             survey_bytes, survey_name = build_excel(payload, TEMPLATE_PATH)
             reports_bytes, reports_name = build_reports(payload, st.session_state.report_fields, ANEXO3_TEMPLATE)
+
+            ok, verification_message = validate_generated_report(reports_bytes, a)
+            if not ok:
+                raise RuntimeError(verification_message)
+
             zip_io = BytesIO()
             with ZipFile(zip_io, "w", ZIP_DEFLATED) as z:
                 z.writestr(survey_name, survey_bytes)
                 z.writestr(reports_name, reports_bytes)
-                if ANEXO3_TEMPLATE.exists():
-                    z.write(ANEXO3_TEMPLATE, arcname=ANEXO3_TEMPLATE.name)
-            st.session_state.generated = (survey_bytes, survey_name, reports_bytes, reports_name, zip_io.getvalue())
-            st.success("Archivos generados correctamente.")
+                # NO incluir la plantilla oficial vacía: podía confundirse con el informe diligenciado.
+                z.writestr(
+                    "LEEME.txt",
+                    (
+                        "EXPEDIENTE ETA GENERADO POR APP ETA v6.4\n"
+                        f"Personas expuestas: {a['total_exposed']}\n"
+                        f"Casos: {a['total_cases']}\n"
+                        f"Tasa de ataque general: {a['attack_rate']*100:.1f}%\n\n"
+                        f"El archivo de informe diligenciado es: {reports_name}\n"
+                        "No se incluye la plantilla vacía dentro de este ZIP.\n"
+                    ).encode("utf-8")
+                )
+            st.session_state.generated = (survey_bytes, survey_name, reports_bytes, reports_name, zip_io.getvalue(), verification_message)
+            st.success("Archivos generados y verificados correctamente.")
+            st.success(verification_message)
         except Exception as exc:
             st.error(f"No fue posible generar los archivos: {exc}")
 
     if "generated" in st.session_state:
-        survey_bytes, survey_name, reports_bytes, reports_name, zip_bytes = st.session_state.generated
+        survey_bytes, survey_name, reports_bytes, reports_name, zip_bytes, verification_message = st.session_state.generated
+        st.success(verification_message)
+        st.caption(f"Versión de la app: {APP_VERSION}. El ZIP contiene únicamente los archivos diligenciados; ya no incluye la plantilla vacía.")
         c1, c2 = st.columns(2)
         c1.download_button(
             "⬇️ Encuesta de consumidores (Anexo 2)", survey_bytes, survey_name,
