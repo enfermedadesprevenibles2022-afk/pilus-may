@@ -8,11 +8,11 @@ import streamlit as st
 
 from excel_generator import MAX_ALIMENTOS, MAX_PERSONAS, MAX_SINTOMAS, PERIODOS, build_excel
 from importer import parse_consumer_excel, person_key
-from report_generator import analyze, build_reports
+from report_generator import analyze, build_reports, build_suggestions
 
 BASE_DIR = Path(__file__).resolve().parent
 TEMPLATE_PATH = BASE_DIR / "plantilla_eta.xlsx"
-ANEXO3_ORIGINAL = BASE_DIR / "Anexo 3.FORMATO_BROTES_ETA_JULIO 2022.xls"
+ANEXO3_TEMPLATE = BASE_DIR / "Anexo_3_ETA_OFICIAL.xlsx"
 
 st.set_page_config(page_title="APP ETA - Investigación de brotes", page_icon="📋", layout="wide")
 
@@ -483,87 +483,171 @@ elif page == "4. Revisar registros":
             st.success(f"Se limpiaron los datos de la persona {clear_no}.")
 
 elif page == "5. Informes y análisis":
-    st.header("5. Informes de 24 horas, 72 horas y final")
+    st.header("5. Análisis epidemiológico e informes oficiales")
     payload = consumer_payload()
     a = analyze(payload)
+    sug = build_suggestions(payload, a)
+
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Expuestos diligenciados", a["total_exposed"])
-    k2.metric("Casos / enfermos", a["total_cases"])
-    k3.metric("Tasa de ataque", f"{a['attack_rate']:.1f}%")
+    k1.metric("Expuestos", a["total_exposed"])
+    k2.metric("Enfermos", a["total_cases"])
+    k3.metric("Tasa de ataque general", f"{a['attack_rate']:.1f}%")
     k4.metric("Hospitalizados", a["hospitalized"])
 
-    with st.expander("Vista rápida del análisis automático", expanded=True):
-        st.markdown("**Signos y síntomas**")
+    if a["missing_age"] or a["missing_sex"]:
+        st.warning(
+            f"Calidad del dato: {a['missing_age']} persona(s) sin edad y {a['missing_sex']} sin sexo. "
+            "El Anexo 3 exige edad y género para que esa tabla cierre exactamente; la app no inventará esos datos."
+        )
+
+    with st.expander("📊 Análisis automático de la encuesta", expanded=True):
+        st.markdown("**Signos y síntomas entre los enfermos**")
         if a["symptom_counts"]:
             st.dataframe(
-                [{"Signo/síntoma": s, "Casos": n, "%": round(pct, 1)} for s, n, pct in a["symptom_counts"]],
-                hide_index=True,
-                width="stretch",
+                [{"Signo/síntoma": s, "Casos": n, "% de casos": round(pct, 1)} for s, n, pct in a["symptom_counts"]],
+                hide_index=True, width="stretch",
             )
-        st.markdown("**Análisis por alimento**")
+        st.markdown("**Análisis por alimento — tabla 2×2**")
         if a["food_analysis"]:
             st.dataframe([{
-                "Alimento": x["food"], "Caso exp.": x["a"], "Sano exp.": x["b"],
-                "Caso no exp.": x["c"], "Sano no exp.": x["d"],
-                "TA exp. %": round((x["attack_exposed"] or 0) * 100, 1),
-                "TA no exp. %": round((x["attack_unexposed"] or 0) * 100, 1),
-                "RR*": round(x["rr"], 2) if x["rr"] is not None else None,
-                "OR*": round(x["or"], 2) if x["or"] is not None else None,
+                "Alimento": x["food"],
+                "Enfermos que consumieron": x["a"],
+                "Sanos que consumieron": x["b"],
+                "Enfermos que NO consumieron": x["c"],
+                "Sanos que NO consumieron": x["d"],
+                "TA consumidores % (observada)": round((x["attack_exposed"] or 0) * 100, 1),
+                "TA no consumidores % (observada)": round((x["attack_unexposed"] or 0) * 100, 1),
+                "Diferencia TA (pp)": round((x["risk_difference"] or 0) * 100, 1) if x.get("risk_difference") is not None else None,
+                "RR usado en Anexo 3": round(x["rr"], 2) if x["rr"] is not None else None,
+                "IC95% RR": (f"{x['rr_low']:.2f}–{x['rr_high']:.2f}" if x.get("rr_low") is not None else ""),
+                "Corrección +1": "Sí" if x["corrected"] else "No",
             } for x in a["food_analysis"]], hide_index=True, width="stretch")
+            st.caption(
+                "Los conteos y tasas observadas se muestran sin modificar. Si alguna celda de la tabla 2×2 es cero, "
+                "el Anexo 3 oficial ordena sumar 1 a las cuatro celdas para sus cálculos de RR/OR; la app aplica esa regla solo al generar el informe."
+            )
+            if a.get("top_food"):
+                top = a["top_food"]
+                st.success(
+                    f"Mayor asociación observada: {top['food']} — "
+                    f"{top['a']}/{top['a'] + top['b']} enfermos entre consumidores y "
+                    f"{top['c']}/{top['c'] + top['d']} entre no consumidores. "
+                    "Es una orientación epidemiológica, no una confirmación causal."
+                )
+
+    with st.expander("🧠 Asistente epidemiológico — borradores para revisión", expanded=True):
+        st.info("Estos textos son sugerencias automáticas basadas en la encuesta. No sustituyen la revisión epidemiológica, IVC ni laboratorio.")
+        st.markdown("**Hipótesis sugerida**")
+        st.write(sug["hipotesis_inicial"])
+        st.markdown("**Definición de caso sugerida**")
+        st.write(sug["definicion_caso"])
+        st.markdown("**Análisis sugerido para 72 horas**")
+        st.write(sug["analisis_resultados"])
 
     rf = st.session_state.report_fields
     with st.form("reports_form"):
         tab24, tab72, tabf = st.tabs(["Informe preliminar / 24 h", "Informe 72 h", "Informe final"])
+
         with tab24:
-            c1, c2 = st.columns(2)
-            casos_upgd = c1.number_input("Casos identificados en UPGD", min_value=0, value=int(rf.get("casos_upgd", 0) or 0))
-            casos_bac = c2.number_input("Casos identificados por BAC", min_value=0, value=int(rf.get("casos_bac", 0) or 0))
-            antecedentes = st.text_area("Antecedentes del brote", rf.get("antecedentes", ""), height=110)
-            posibles = st.text_area("Posibles alimentos/agua o mecanismos de transmisión", rf.get("posibles_alimentos", ", ".join(st.session_state.foods)), height=90)
-            hip = st.text_area("Hipótesis inicial", rf.get("hipotesis_inicial", ""), height=100)
+            c1, c2, c3 = st.columns(3)
+            casos_upgd = c1.number_input("Casos UPGD", min_value=0, value=int(rf.get("casos_upgd", 0) or 0))
+            default_bac = max(a["total_cases"] - int(casos_upgd), 0)
+            casos_bac = c2.number_input("Casos BAC", min_value=0, value=int(rf.get("casos_bac", default_bac) if rf.get("casos_bac", None) is not None else default_bac))
+            casos_muertos = c3.number_input("Casos muertos", min_value=0, value=int(rf.get("casos_muertos", 0) or 0))
+
+            c4, c5 = st.columns(2)
+            notif_opts = ["", "Sí", "No"]
+            notif_old = rf.get("notificacion_inmediata", "")
+            notificacion_inmediata = c4.selectbox("¿Cumple parámetros de notificación inmediata?", notif_opts, index=notif_opts.index(notif_old) if notif_old in notif_opts else 0)
+            semana_epidemiologica = c5.number_input("Semana epidemiológica", min_value=0, max_value=53, value=int(rf.get("semana_epidemiologica", 0) or 0))
+
+            antecedentes = st.text_area("Antecedentes del brote", rf.get("antecedentes") or sug["resumen"], height=110)
+            posibles = st.text_area("Posibles alimentos/agua o mecanismos de transmisión", rf.get("posibles_alimentos") or sug["posibles_alimentos"], height=90)
+            hip = st.text_area("Hipótesis inicial — editable", rf.get("hipotesis_inicial") or sug["hipotesis_inicial"], height=135)
             medidas = st.text_area("Medidas iniciales de control", rf.get("medidas_control", ""), height=110)
-            otra = st.text_area("Otra información relevante", rf.get("otra_informacion", ""), height=90)
+            otra = st.text_area("Observaciones", rf.get("otra_informacion", ""), height=90)
+
+            st.markdown("**Muestras recolectadas**")
+            m1, m2, m3, m4 = st.columns(4)
+            muestras_biologicas = m1.checkbox("Biológicas", value=bool(rf.get("muestras_biologicas", a["with_sample"] > 0)))
+            muestras_superficies = m2.checkbox("Superficies", value=bool(rf.get("muestras_superficies", False)))
+            muestras_alimentos = m3.checkbox("Alimentos", value=bool(rf.get("muestras_alimentos", False)))
+            muestras_manipuladores = m4.checkbox("Manipuladores", value=bool(rf.get("muestras_manipuladores", False)))
+
+            i1, i2 = st.columns(2)
+            industrial_opts = ["", "Sí", "No"]
+            industrial_old = rf.get("alimento_industrializado", "")
+            alimento_industrializado = i1.selectbox("¿Alimento industrializado?", industrial_opts, index=industrial_opts.index(industrial_old) if industrial_old in industrial_opts else 0)
+            datos_industrializado = i2.text_input("Datos fabricante/producto", rf.get("datos_industrializado", ""))
+            a1, a2 = st.columns(2)
+            apoyo_old = rf.get("requiere_apoyo", "")
+            requiere_apoyo = a1.selectbox("¿Requiere apoyo de otras instancias?", industrial_opts, index=industrial_opts.index(apoyo_old) if apoyo_old in industrial_opts else 0)
+            apoyo_instancias = a2.text_input("¿Cuáles instancias?", rf.get("apoyo_instancias", ""))
+
         with tab72:
-            definicion = st.text_area("Definición operacional de caso", rf.get("definicion_caso", ""), height=100)
+            definicion = st.text_area("Definición operacional de caso — editable", rf.get("definicion_caso") or sug["definicion_caso"], height=120)
             manejo = st.text_area("Manejo y tratamiento clínico / complicaciones", rf.get("manejo_clinico", ""), height=100)
-            lab = st.text_area("Resultados de laboratorio disponibles", rf.get("resultados_laboratorio", ""), height=100)
-            hallazgos = st.text_area("Hallazgos ambientales / factores de riesgo", rf.get("hallazgos_ambientales", ""), height=110)
-            analisis = st.text_area("Análisis de resultados e hipótesis", rf.get("analisis_resultados", ""), height=110)
-            medidas72 = st.text_area("Medidas de control implementadas", rf.get("medidas_control_72", ""), height=100)
-            rec72 = st.text_area("Recomendaciones - 72 horas", rf.get("recomendaciones_72", ""), height=100)
-            con72 = st.text_area("Conclusiones - 72 horas", rf.get("conclusiones_72", ""), height=100)
+            hallazgos = st.text_area("Análisis de puntos críticos / hallazgos IVC", rf.get("hallazgos_ambientales", ""), height=120)
+            analisis = st.text_area("Análisis epidemiológico — borrador editable", rf.get("analisis_resultados") or sug["analisis_resultados"], height=150)
+            rec72 = st.text_area("Recomendaciones - 72 horas", rf.get("recomendaciones_72", ""), height=110)
+            con72 = st.text_area("Conclusiones - 72 horas", rf.get("conclusiones_72") or sug["conclusiones_72"], height=110)
+            tipos = ["", "Hogar", "Establecimiento educativo", "Establecimiento penitenciario", "Casino institucional", "Establecimiento militar", "Hogar geriátrico", "Hogar de bienestar familiar", "Club social", "Restaurante comercial", "Otro"]
+            old_tipo = rf.get("tipo_establecimiento", "")
+            tipo_establecimiento = st.selectbox("Tipo de establecimiento/lugar de consumo", tipos, index=tipos.index(old_tipo) if old_tipo in tipos else 0)
+
         with tabf:
-            fecha_cierre = st.date_input("Fecha de cierre del brote", value=rf.get("fecha_cierre"), format="DD/MM/YYYY")
+            f1, f2 = st.columns(2)
+            fecha_agente = f1.date_input("Fecha de identificación del agente (si aplica)", value=rf.get("fecha_agente"), format="DD/MM/YYYY")
+            fecha_cierre = f2.date_input("Fecha de cierre del brote", value=rf.get("fecha_cierre"), format="DD/MM/YYYY")
             estados = ["", "Abierto", "Cerrado con agente identificado", "Cerrado sin agente identificado"]
             est_old = rf.get("estado_brote", "")
             estado = st.selectbox("Estado del brote", estados, index=estados.index(est_old) if est_old in estados else 0)
             agente = st.text_input("Agente identificado", rf.get("agente_identificado", ""))
-            fuente = st.text_input("Fuente / alimento implicado", rf.get("fuente_implicada", ""))
-            modo = st.text_input("Modo de transmisión", rf.get("modo_transmision", ""))
-            resumen = st.text_area("Resumen de la situación", rf.get("resumen_final", ""), height=110)
-            descripcion = st.text_area("Descripción del brote", rf.get("descripcion_brote", ""), height=110)
-            labf = st.text_area("Resultados de laboratorio finales", rf.get("resultados_laboratorio_final", ""), height=100)
-            factores = st.text_area("Factores determinantes", rf.get("factores_determinantes", ""), height=100)
-            recf = st.text_area("Recomendaciones finales", rf.get("recomendaciones_final", ""), height=100)
-            conf = st.text_area("Conclusiones finales", rf.get("conclusiones_final", ""), height=100)
-            plan = st.text_area("Plan de mejoramiento / seguimiento", rf.get("plan_mejoramiento", ""), height=110)
-        responsable = st.text_input("Responsable de elaboración de los informes", rf.get("responsable", st.session_state.general.get("encuestador", "")))
+            fuentes = ["Alimentos", "Agua", "Persona a persona", "Contaminación medio ambiental", "Otro", "Desconocido"]
+            fuente_old = rf.get("fuente_transmision", "Alimentos")
+            fuente_transmision = st.selectbox("Fuente de transmisión", fuentes, index=fuentes.index(fuente_old) if fuente_old in fuentes else 0)
+            modos = ["Oral", "Oral - fecal", "Cruzada", ""]
+            modo_old = rf.get("modo_transmision", "Oral")
+            modo = st.selectbox("Modo de transmisión", modos, index=modos.index(modo_old) if modo_old in modos else 0)
+            resumen = st.text_area("Resumen de la situación", rf.get("resumen_final") or sug["resumen_final"], height=130)
+            descripcion = st.text_area("Descripción del brote", rf.get("descripcion_brote") or sug["descripcion_brote"], height=140)
+            factores = st.text_area("Factores determinantes", rf.get("factores_determinantes") or rf.get("hallazgos_ambientales", ""), height=110)
+            recf = st.text_area("Recomendaciones finales", rf.get("recomendaciones_final") or rf.get("recomendaciones_72", ""), height=110)
+            conf = st.text_area("Conclusiones finales", rf.get("conclusiones_final") or sug["conclusiones_final"], height=120)
+            plan = st.text_area("Seguimiento a puntos críticos / plan de mejoramiento", rf.get("plan_mejoramiento", ""), height=110)
+
+        st.markdown("**Responsables del informe**")
+        r1, r2 = st.columns(2)
+        responsable = r1.text_input("Profesional que elaboró", rf.get("responsable", st.session_state.general.get("encuestador", "")))
+        revisor = r2.text_input("Profesional que revisó", rf.get("revisor", ""))
+        r3, r4 = st.columns(2)
+        telefono_responsable = r3.text_input("Teléfono/celular", rf.get("telefono_responsable", st.session_state.general.get("telefono_encuestador", "")))
+        email_responsable = r4.text_input("Correo electrónico", rf.get("email_responsable", ""))
+
         save_reports = st.form_submit_button("💾 Guardar información de los informes", type="primary", width="stretch")
+
     if save_reports:
         st.session_state.report_fields = {
-            "casos_upgd": casos_upgd, "casos_bac": casos_bac, "antecedentes": antecedentes,
-            "posibles_alimentos": posibles, "hipotesis_inicial": hip, "medidas_control": medidas,
-            "otra_informacion": otra, "definicion_caso": definicion, "manejo_clinico": manejo,
-            "resultados_laboratorio": lab, "hallazgos_ambientales": hallazgos,
-            "analisis_resultados": analisis, "medidas_control_72": medidas72,
-            "recomendaciones_72": rec72, "conclusiones_72": con72,
-            "fecha_cierre": fecha_cierre, "estado_brote": estado, "agente_identificado": agente,
-            "fuente_implicada": fuente, "modo_transmision": modo, "resumen_final": resumen,
-            "descripcion_brote": descripcion, "resultados_laboratorio_final": labf,
-            "factores_determinantes": factores, "recomendaciones_final": recf,
-            "conclusiones_final": conf, "plan_mejoramiento": plan, "responsable": responsable,
+            "casos_upgd": casos_upgd, "casos_bac": casos_bac, "casos_muertos": casos_muertos,
+            "notificacion_inmediata": notificacion_inmediata, "semana_epidemiologica": semana_epidemiologica,
+            "antecedentes": antecedentes, "posibles_alimentos": posibles, "hipotesis_inicial": hip,
+            "medidas_control": medidas, "otra_informacion": otra,
+            "muestras_biologicas": muestras_biologicas, "muestras_superficies": muestras_superficies,
+            "muestras_alimentos": muestras_alimentos, "muestras_manipuladores": muestras_manipuladores,
+            "alimento_industrializado": alimento_industrializado, "datos_industrializado": datos_industrializado,
+            "requiere_apoyo": requiere_apoyo, "apoyo_instancias": apoyo_instancias,
+            "definicion_caso": definicion, "manejo_clinico": manejo, "hallazgos_ambientales": hallazgos,
+            "analisis_resultados": analisis, "recomendaciones_72": rec72, "conclusiones_72": con72,
+            "tipo_establecimiento": tipo_establecimiento,
+            "fecha_agente": fecha_agente, "fecha_cierre": fecha_cierre, "estado_brote": estado,
+            "agente_identificado": agente, "fuente_transmision": fuente_transmision, "modo_transmision": modo,
+            "resumen_final": resumen, "descripcion_brote": descripcion, "factores_determinantes": factores,
+            "recomendaciones_final": recf, "conclusiones_final": conf, "plan_mejoramiento": plan,
+            "responsable": responsable, "revisor": revisor, "telefono_responsable": telefono_responsable,
+            "email_responsable": email_responsable,
         }
-        st.success("Información de los informes guardada.")
+        st.session_state.pop("generated", None)
+        st.success("Información guardada. El Anexo 3 se generará sobre la plantilla oficial, sin rediseñarla.")
 
 else:
     st.header("6. Generar y descargar")
@@ -575,13 +659,13 @@ else:
     if st.button("⚙️ Generar archivos del brote", type="primary", width="stretch"):
         try:
             survey_bytes, survey_name = build_excel(payload, TEMPLATE_PATH)
-            reports_bytes, reports_name = build_reports(payload, st.session_state.report_fields)
+            reports_bytes, reports_name = build_reports(payload, st.session_state.report_fields, ANEXO3_TEMPLATE)
             zip_io = BytesIO()
             with ZipFile(zip_io, "w", ZIP_DEFLATED) as z:
                 z.writestr(survey_name, survey_bytes)
                 z.writestr(reports_name, reports_bytes)
-                if ANEXO3_ORIGINAL.exists():
-                    z.write(ANEXO3_ORIGINAL, arcname=ANEXO3_ORIGINAL.name)
+                if ANEXO3_TEMPLATE.exists():
+                    z.write(ANEXO3_TEMPLATE, arcname=ANEXO3_TEMPLATE.name)
             st.session_state.generated = (survey_bytes, survey_name, reports_bytes, reports_name, zip_io.getvalue())
             st.success("Archivos generados correctamente.")
         except Exception as exc:
@@ -602,10 +686,10 @@ else:
             "📦 Descargar expediente completo", zip_bytes, "ETA_expediente_completo.zip", "application/zip",
             type="primary", width="stretch",
         )
-        if ANEXO3_ORIGINAL.exists():
+        if ANEXO3_TEMPLATE.exists():
             st.download_button(
-                "📄 Descargar Anexo 3 original aportado", ANEXO3_ORIGINAL.read_bytes(), ANEXO3_ORIGINAL.name,
-                "application/vnd.ms-excel", width="stretch",
+                "📄 Descargar plantilla oficial Anexo 3", ANEXO3_TEMPLATE.read_bytes(), ANEXO3_TEMPLATE.name,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", width="stretch",
             )
 
 st.divider()
