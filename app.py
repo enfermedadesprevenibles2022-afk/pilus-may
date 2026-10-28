@@ -3,6 +3,7 @@ from __future__ import annotations
 from io import BytesIO
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
+import re
 
 import streamlit as st
 from openpyxl import load_workbook
@@ -17,7 +18,7 @@ ANEXO3_TEMPLATE = BASE_DIR / "Anexo_3_ETA_OFICIAL.xlsx"
 
 st.set_page_config(page_title="APP ETA - Investigación de brotes", page_icon="📋", layout="wide")
 
-APP_VERSION = "6.4"
+APP_VERSION = "6.5"
 
 DEFAULT_SYMPTOMS = ["Vómito", "Diarrea", "Náuseas", "Dolor abdominal", "Fiebre"]
 MODULES = [
@@ -213,6 +214,36 @@ def validate_generated_report(report_bytes: bytes, analysis: dict) -> tuple[bool
         return True, f"Anexo 3 verificado: {expected_exposed} expuestos y {expected_cases} casos escritos en el formato."
     except Exception as exc:
         return False, f"No fue posible verificar el Anexo 3 generado: {exc}"
+
+
+def validate_excel_compatibility(report_bytes: bytes) -> tuple[bool, str]:
+    """Detecta el problema que hace que Excel para Mac intente reparar el OOXML."""
+    try:
+        with ZipFile(BytesIO(report_bytes), "r") as z:
+            parts = [
+                "xl/workbook.xml",
+                "xl/worksheets/sheet1.xml",
+                "xl/worksheets/sheet2.xml",
+                "xl/worksheets/sheet3.xml",
+            ]
+            for part in parts:
+                xml = z.read(part).decode("utf-8", "strict")
+                head = xml[:5000]
+                match = re.search(r'(?:mc:Ignorable|[^: ]+:Ignorable)="([^"]+)"', head)
+                if not match:
+                    continue
+                missing = []
+                for prefix in match.group(1).split():
+                    if f"xmlns:{prefix}=" not in head:
+                        missing.append(prefix)
+                if missing:
+                    return False, (
+                        f"Compatibilidad OOXML fallida en {part}: faltan declaraciones de namespace "
+                        f"para {', '.join(missing)}. No se habilitará la descarga para evitar que Excel repare el archivo."
+                    )
+        return True, "Compatibilidad Excel verificada: estructura OOXML y namespaces conservados."
+    except Exception as exc:
+        return False, f"No fue posible validar la compatibilidad del archivo con Excel: {exc}"
 
 
 def apply_import(parsed: dict, mode: str) -> dict:
@@ -799,6 +830,9 @@ else:
             ok, verification_message = validate_generated_report(reports_bytes, a)
             if not ok:
                 raise RuntimeError(verification_message)
+            compat_ok, compat_message = validate_excel_compatibility(reports_bytes)
+            if not compat_ok:
+                raise RuntimeError(compat_message)
 
             zip_io = BytesIO()
             with ZipFile(zip_io, "w", ZIP_DEFLATED) as z:
@@ -808,7 +842,7 @@ else:
                 z.writestr(
                     "LEEME.txt",
                     (
-                        "EXPEDIENTE ETA GENERADO POR APP ETA v6.4\n"
+                        "EXPEDIENTE ETA GENERADO POR APP ETA v6.5\n"
                         f"Personas expuestas: {a['total_exposed']}\n"
                         f"Casos: {a['total_cases']}\n"
                         f"Tasa de ataque general: {a['attack_rate']*100:.1f}%\n\n"
@@ -816,15 +850,17 @@ else:
                         "No se incluye la plantilla vacía dentro de este ZIP.\n"
                     ).encode("utf-8")
                 )
-            st.session_state.generated = (survey_bytes, survey_name, reports_bytes, reports_name, zip_io.getvalue(), verification_message)
+            st.session_state.generated = (survey_bytes, survey_name, reports_bytes, reports_name, zip_io.getvalue(), verification_message, compat_message)
             st.success("Archivos generados y verificados correctamente.")
             st.success(verification_message)
+            st.success(compat_message)
         except Exception as exc:
             st.error(f"No fue posible generar los archivos: {exc}")
 
     if "generated" in st.session_state:
-        survey_bytes, survey_name, reports_bytes, reports_name, zip_bytes, verification_message = st.session_state.generated
+        survey_bytes, survey_name, reports_bytes, reports_name, zip_bytes, verification_message, compat_message = st.session_state.generated
         st.success(verification_message)
+        st.success(compat_message)
         st.caption(f"Versión de la app: {APP_VERSION}. El ZIP contiene únicamente los archivos diligenciados; ya no incluye la plantilla vacía.")
         c1, c2 = st.columns(2)
         c1.download_button(

@@ -12,6 +12,8 @@ import re
 import unicodedata
 import xml.etree.ElementTree as ET
 
+GENERATOR_VERSION = "6.5"
+
 AGE_GROUPS = [
     ("Menor de 1 año", None, 0),
     ("De 1 a 4 años", 1, 4),
@@ -25,8 +27,31 @@ AGE_GROUPS = [
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS_PKGREL = "http://schemas.openxmlformats.org/package/2006/relationships"
-ET.register_namespace("", NS_MAIN)
-ET.register_namespace("r", NS_REL)
+
+# Excel usa estos prefijos en mc:Ignorable y en metadatos de revisión.
+# ElementTree cambia los prefijos a ns1/ns2 al serializar si no se registran,
+# lo que hace que Excel para Mac intente "reparar" el libro. Mantener los
+# nombres originales conserva la compatibilidad del paquete OOXML oficial.
+EXCEL_NS_PREFIXES = {
+    "": NS_MAIN,
+    "r": NS_REL,
+    "mc": "http://schemas.openxmlformats.org/markup-compatibility/2006",
+    "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing",
+    "x14": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main",
+    "x14ac": "http://schemas.microsoft.com/office/spreadsheetml/2009/9/ac",
+    "x15": "http://schemas.microsoft.com/office/spreadsheetml/2010/11/main",
+    "xr": "http://schemas.microsoft.com/office/spreadsheetml/2014/revision",
+    "xr2": "http://schemas.microsoft.com/office/spreadsheetml/2015/revision2",
+    "xr3": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision3",
+    "xr6": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision6",
+    "xr10": "http://schemas.microsoft.com/office/spreadsheetml/2016/revision10",
+    "xcalcf": "http://schemas.microsoft.com/office/spreadsheetml/2018/calcfeatures",
+}
+for _prefix, _uri in EXCEL_NS_PREFIXES.items():
+    ET.register_namespace(_prefix, _uri)
+
+WORKBOOK_DECLS = ["mc", "x15", "xr", "xr6", "xr10", "xr2", "xcalcf"]
+WORKSHEET_DECLS = ["r", "xdr", "x14", "mc", "x14ac", "xr", "xr2", "xr3"]
 
 
 def _clean(v: Any) -> str:
@@ -529,9 +554,32 @@ class XlsxTemplatePatcher:
             else:
                 v.text = str(value)
 
+    @staticmethod
+    def _used_namespace_uris(root):
+        used = set()
+        for elem in root.iter():
+            if isinstance(elem.tag, str) and elem.tag.startswith("{"):
+                used.add(elem.tag[1:].split("}", 1)[0])
+            for key in elem.attrib:
+                if key.startswith("{"):
+                    used.add(key[1:].split("}", 1)[0])
+        return used
+
+    @classmethod
+    def _ensure_declared_prefixes(cls, root, prefixes):
+        # Los namespaces realmente usados se declaran automáticamente con el
+        # prefijo registrado. Los que solo aparecen dentro de mc:Ignorable
+        # deben mantenerse como declaraciones explícitas en la raíz.
+        used = cls._used_namespace_uris(root)
+        for prefix in prefixes:
+            uri = EXCEL_NS_PREFIXES[prefix]
+            if uri not in used:
+                root.set(f"xmlns:{prefix}", uri)
+
     def save_bytes(self) -> bytes:
         # Pedir recálculo completo al abrir en Excel.
         wb = ET.fromstring(self.files["xl/workbook.xml"])
+        self._ensure_declared_prefixes(wb, WORKBOOK_DECLS)
         calc = wb.find(f"{{{NS_MAIN}}}calcPr")
         if calc is None:
             calc = ET.SubElement(wb, f"{{{NS_MAIN}}}calcPr")
@@ -542,6 +590,7 @@ class XlsxTemplatePatcher:
         self.files["xl/workbook.xml"] = ET.tostring(wb, encoding="utf-8", xml_declaration=True)
 
         for name, root in self.trees.items():
+            self._ensure_declared_prefixes(root, WORKSHEET_DECLS)
             self.files[self.sheet_paths[name]] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
         out = BytesIO()
