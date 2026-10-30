@@ -12,7 +12,7 @@ import re
 import unicodedata
 import xml.etree.ElementTree as ET
 
-GENERATOR_VERSION = "6.5"
+GENERATOR_VERSION = "6.6"
 
 AGE_GROUPS = [
     ("Menor de 1 año", None, 0),
@@ -425,18 +425,26 @@ def build_suggestions(payload: dict, analysis: dict | None = None) -> dict:
 
 
 class XlsxTemplatePatcher:
-    """Edita únicamente valores de celdas del XLSX oficial, conservando formato, imágenes, fórmulas y gráficos."""
+    """Escritor OOXML conservador.
+
+    No parsea ni reserializa hojas completas. Conserva cada XML original de la
+    plantilla y sustituye únicamente el nodo de la celda que se necesita. Esto
+    evita alterar namespaces, relaciones, dibujos, gráficos o metadatos que
+    Excel para Mac valida de forma estricta.
+    """
 
     def __init__(self, template_path: Path):
         self.template_path = Path(template_path)
         if not self.template_path.exists():
             raise FileNotFoundError(f"No se encontró la plantilla oficial: {self.template_path.name}")
         with ZipFile(self.template_path, "r") as zin:
-            self.files = {name: zin.read(name) for name in zin.namelist()}
+            self.infos = {info.filename: info for info in zin.infolist()}
+            self.files = {info.filename: zin.read(info.filename) for info in zin.infolist()}
         self.sheet_paths = self._sheet_paths()
-        self.trees: dict[str, ET.Element] = {}
+        self.sheet_xml: dict[str, str] = {}
 
     def _sheet_paths(self):
+        # Solo leemos workbook/rels para localizar cada hoja; no los reescribimos.
         wb = ET.fromstring(self.files["xl/workbook.xml"])
         rels = ET.fromstring(self.files["xl/_rels/workbook.xml.rels"])
         rmap = {r.attrib["Id"]: r.attrib["Target"] for r in rels}
@@ -449,67 +457,79 @@ class XlsxTemplatePatcher:
             out[sheet.attrib["name"]] = target
         return out
 
+    def _xml(self, sheet_name: str) -> str:
+        if sheet_name not in self.sheet_xml:
+            path = self.sheet_paths[sheet_name]
+            self.sheet_xml[sheet_name] = self.files[path].decode("utf-8")
+        return self.sheet_xml[sheet_name]
+
     @staticmethod
-    def _split_ref(ref: str):
-        m = re.fullmatch(r"([A-Z]+)(\d+)", ref.upper())
+    def _cell_pattern(ref: str):
+        ref = re.escape(ref.upper())
+        return re.compile(
+            rf'(?:<c\b(?=[^>]*\br="{ref}")[^>]*?/>|<c\b(?=[^>]*\br="{ref}")[^>]*>.*?</c>)',
+            re.DOTALL,
+        )
+
+    @staticmethod
+    def _open_tag(cell_xml: str) -> str:
+        if cell_xml.endswith("/>"):
+            return cell_xml[:-2] + ">"
+        return cell_xml[: cell_xml.find(">") + 1]
+
+    @staticmethod
+    def _without_type(open_tag: str) -> str:
+        return re.sub(r'\s+t="[^"]*"', "", open_tag)
+
+    def _replace_cell(self, sheet: str, ref: str, builder):
+        xml = self._xml(sheet)
+        pat = self._cell_pattern(ref)
+        m = pat.search(xml)
         if not m:
-            raise ValueError(f"Referencia de celda inválida: {ref}")
-        col, row = m.group(1), int(m.group(2))
-        n = 0
-        for ch in col:
-            n = n * 26 + ord(ch) - 64
-        return n, row
-
-    def _root(self, sheet_name: str):
-        if sheet_name not in self.trees:
-            self.trees[sheet_name] = ET.fromstring(self.files[self.sheet_paths[sheet_name]])
-        return self.trees[sheet_name]
-
-    def _cell(self, sheet_name: str, ref: str):
-        root = self._root(sheet_name)
-        sheet_data = root.find(f"{{{NS_MAIN}}}sheetData")
-        col_num, row_num = self._split_ref(ref)
-        row = sheet_data.find(f"{{{NS_MAIN}}}row[@r='{row_num}']")
-        if row is None:
-            row = ET.Element(f"{{{NS_MAIN}}}row", {"r": str(row_num)})
-            rows = list(sheet_data)
-            pos = next((i for i, x in enumerate(rows) if int(x.attrib.get("r", 0)) > row_num), len(rows))
-            sheet_data.insert(pos, row)
-        cell = row.find(f"{{{NS_MAIN}}}c[@r='{ref.upper()}']")
-        if cell is None:
-            cell = ET.Element(f"{{{NS_MAIN}}}c", {"r": ref.upper()})
-            cells = list(row)
-            pos = len(cells)
-            for i, other in enumerate(cells):
-                other_col, _ = self._split_ref(other.attrib["r"])
-                if other_col > col_num:
-                    pos = i
-                    break
-            row.insert(pos, cell)
-        return cell
+            raise ValueError(
+                f"La celda {ref} no existe en la plantilla oficial ({sheet}). "
+                "Se detuvo la generación para no dañar el archivo."
+            )
+        old = m.group(0)
+        new = builder(old)
+        self.sheet_xml[sheet] = xml[:m.start()] + new + xml[m.end():]
 
     @staticmethod
-    def _clear_children(cell):
-        for child in list(cell):
-            cell.remove(child)
+    def _escape_text(value: Any) -> str:
+        s = _clean(value)
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
     def set_text(self, sheet: str, ref: str, value: Any):
-        cell = self._cell(sheet, ref)
-        self._clear_children(cell)
-        cell.set("t", "inlineStr")
-        isel = ET.SubElement(cell, f"{{{NS_MAIN}}}is")
-        t = ET.SubElement(isel, f"{{{NS_MAIN}}}t")
-        text = _clean(value)
-        if text.startswith(" ") or text.endswith(" ") or "\n" in text:
-            t.set("{http://www.w3.org/XML/1998/namespace}space", "preserve")
-        t.text = text
+        text_value = _clean(value)
+        # En celdas visuales/mezcladas la plantilla puede no tener nodo <c>.
+        # Si solo queremos dejarla vacía, no crear estructura nueva.
+        if text_value == "" and not self._cell_pattern(ref).search(self._xml(sheet)):
+            return
+        escaped = self._escape_text(text_value)
+
+        def build(old: str):
+            tag = self._without_type(self._open_tag(old))
+            tag = tag[:-1] + ' t="inlineStr">'
+            preserve = ' xml:space="preserve"' if (
+                text_value.startswith(" ") or text_value.endswith(" ") or "\n" in text_value
+            ) else ""
+            return f'{tag}<is><t{preserve}>{escaped}</t></is></c>'
+
+        self._replace_cell(sheet, ref, build)
 
     def set_number(self, sheet: str, ref: str, value: Any):
-        cell = self._cell(sheet, ref)
-        self._clear_children(cell)
-        cell.attrib.pop("t", None)
-        v = ET.SubElement(cell, f"{{{NS_MAIN}}}v")
-        v.text = str(int(value) if isinstance(value, (int, float)) and float(value).is_integer() else value)
+        if value in (None, ""):
+            return self.set_text(sheet, ref, "")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            num = str(int(value)) if float(value).is_integer() else repr(float(value))
+        else:
+            num = str(value)
+
+        def build(old: str):
+            tag = self._without_type(self._open_tag(old))
+            return f'{tag}<v>{num}</v></c>'
+
+        self._replace_cell(sheet, ref, build)
 
     def set(self, sheet: str, ref: str, value: Any):
         if value is None or value == "":
@@ -525,80 +545,52 @@ class XlsxTemplatePatcher:
         self.set_text(sheet, ref, "X" if selected else "")
 
     def set_formula_cache(self, sheet: str, ref: str, value: Any):
-        """Actualiza el valor visible/cache de una celda con fórmula sin borrar la fórmula ni el formato."""
-        cell = self._cell(sheet, ref)
-        f_tag = f"{{{NS_MAIN}}}f"
-        v_tag = f"{{{NS_MAIN}}}v"
-        formula = cell.find(f_tag)
-        if formula is None:
-            self.set(sheet, ref, value)
+        if value in (None, "") and not self._cell_pattern(ref).search(self._xml(sheet)):
             return
-        for child in list(cell):
-            if child.tag != f_tag:
-                cell.remove(child)
-        if isinstance(value, str):
-            cell.set("t", "str")
-            v = ET.SubElement(cell, v_tag)
-            v.text = value
-        elif value is None or value == "":
-            cell.attrib.pop("t", None)
-            v = ET.SubElement(cell, v_tag)
-            v.text = ""
-        else:
-            cell.attrib.pop("t", None)
-            v = ET.SubElement(cell, v_tag)
+        def build(old: str):
+            formula_match = re.search(r'(<f\b[^>]*>.*?</f>|<f\b[^>]*/>)', old, re.DOTALL)
+            if not formula_match:
+                # Si la celda no es fórmula en esta versión de la plantilla, escribir valor normal.
+                tag = self._without_type(self._open_tag(old))
+                if value in (None, ""):
+                    return f'{tag[:-1]} t="inlineStr"><is><t></t></is></c>'
+                if isinstance(value, str):
+                    escaped = self._escape_text(value)
+                    return f'{tag[:-1]} t="inlineStr"><is><t>{escaped}</t></is></c>'
+                num = str(int(value)) if isinstance(value, (int, float)) and float(value).is_integer() else str(value)
+                return f'{tag}<v>{num}</v></c>'
+
+            formula_xml = formula_match.group(1)
+            tag = self._without_type(self._open_tag(old))
+            if value in (None, ""):
+                return f'{tag}{formula_xml}<v></v></c>'
+            if isinstance(value, str):
+                escaped = self._escape_text(value)
+                return f'{tag[:-1]} t="str">{formula_xml}<v>{escaped}</v></c>'
             if isinstance(value, bool):
-                v.text = "1" if value else "0"
+                val = "1" if value else "0"
             elif isinstance(value, (int, float)) and float(value).is_integer():
-                v.text = str(int(value))
+                val = str(int(value))
             else:
-                v.text = str(value)
+                val = str(value)
+            return f'{tag}{formula_xml}<v>{val}</v></c>'
 
-    @staticmethod
-    def _used_namespace_uris(root):
-        used = set()
-        for elem in root.iter():
-            if isinstance(elem.tag, str) and elem.tag.startswith("{"):
-                used.add(elem.tag[1:].split("}", 1)[0])
-            for key in elem.attrib:
-                if key.startswith("{"):
-                    used.add(key[1:].split("}", 1)[0])
-        return used
-
-    @classmethod
-    def _ensure_declared_prefixes(cls, root, prefixes):
-        # Los namespaces realmente usados se declaran automáticamente con el
-        # prefijo registrado. Los que solo aparecen dentro de mc:Ignorable
-        # deben mantenerse como declaraciones explícitas en la raíz.
-        used = cls._used_namespace_uris(root)
-        for prefix in prefixes:
-            uri = EXCEL_NS_PREFIXES[prefix]
-            if uri not in used:
-                root.set(f"xmlns:{prefix}", uri)
+        self._replace_cell(sheet, ref, build)
 
     def save_bytes(self) -> bytes:
-        # Pedir recálculo completo al abrir en Excel.
-        wb = ET.fromstring(self.files["xl/workbook.xml"])
-        self._ensure_declared_prefixes(wb, WORKBOOK_DECLS)
-        calc = wb.find(f"{{{NS_MAIN}}}calcPr")
-        if calc is None:
-            calc = ET.SubElement(wb, f"{{{NS_MAIN}}}calcPr")
-        calc.set("calcMode", "auto")
-        calc.set("fullCalcOnLoad", "1")
-        calc.set("forceFullCalc", "1")
-        calc.set("calcId", "0")
-        self.files["xl/workbook.xml"] = ET.tostring(wb, encoding="utf-8", xml_declaration=True)
-
-        for name, root in self.trees.items():
-            self._ensure_declared_prefixes(root, WORKSHEET_DECLS)
-            self.files[self.sheet_paths[name]] = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-
+        # Sustituir exclusivamente las hojas modificadas; el resto del paquete
+        # queda byte por byte como en la plantilla oficial.
+        replacements = {
+            self.sheet_paths[name]: xml.encode("utf-8")
+            for name, xml in self.sheet_xml.items()
+        }
         out = BytesIO()
-        with ZipFile(out, "w", ZIP_DEFLATED) as zout:
+        with ZipFile(out, "w") as zout:
             for name, data in self.files.items():
-                zout.writestr(name, data)
+                info = self.infos[name]
+                payload = replacements.get(name, data)
+                zout.writestr(info, payload)
         return out.getvalue()
-
 
 def _top_foods_text(a: dict, n=3):
     return ", ".join(x["food"] for x in a["food_analysis"][:n])

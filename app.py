@@ -18,7 +18,7 @@ ANEXO3_TEMPLATE = BASE_DIR / "Anexo_3_ETA_OFICIAL.xlsx"
 
 st.set_page_config(page_title="APP ETA - Investigación de brotes", page_icon="📋", layout="wide")
 
-APP_VERSION = "6.5"
+APP_VERSION = "6.6"
 
 DEFAULT_SYMPTOMS = ["Vómito", "Diarrea", "Náuseas", "Dolor abdominal", "Fiebre"]
 MODULES = [
@@ -842,7 +842,7 @@ else:
                 z.writestr(
                     "LEEME.txt",
                     (
-                        "EXPEDIENTE ETA GENERADO POR APP ETA v6.5\n"
+                        "EXPEDIENTE ETA GENERADO POR APP ETA v6.6\n"
                         f"Personas expuestas: {a['total_exposed']}\n"
                         f"Casos: {a['total_cases']}\n"
                         f"Tasa de ataque general: {a['attack_rate']*100:.1f}%\n\n"
